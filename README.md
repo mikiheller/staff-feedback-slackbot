@@ -42,14 +42,12 @@ Vercel.
 2. App name: `Staff feedback drafter` (or whatever you want — only you see it).
 3. Workspace: pick your household workspace.
 
-Once it's created, you'll do these in the left sidebar:
+Once it's created, you'll do these in the left sidebar.
 
-#### a. App Home
+> Note: do **OAuth & Permissions first**. Slack disables the "Messages Tab"
+> toggle on the App Home page until your bot has at least one scope.
 
-- Under **Show Tabs**, enable the **Messages Tab** so you can DM the bot.
-- Check **Allow users to send Slash commands and messages from the messages tab**.
-
-#### b. OAuth & Permissions → Scopes
+#### a. OAuth & Permissions → Scopes
 
 Add these **Bot Token Scopes**:
 
@@ -63,6 +61,11 @@ Add these **User Token Scopes** (this is the magic for "send as me"):
 
 - `chat:write` — post the final message **as you**
 - `im:write` — open DMs to your staff **as you**
+
+#### b. App Home
+
+- Under **Show Tabs**, enable the **Messages Tab** so you can DM the bot.
+- Check **Allow users to send Slash commands and messages from the messages tab**.
 
 #### c. Event Subscriptions
 
