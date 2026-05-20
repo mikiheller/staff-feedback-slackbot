@@ -33,16 +33,42 @@ export function pickActionableMessage(
 ): SlackMessageEvent | null {
   const event = envelope.event;
 
-  if (event.type !== "message") return null;
-  if (event.channel_type !== "im") return null; // only DMs
-  if (event.bot_id) return null; // ignore our own bot's posts
-  if (event.user !== env.OWNER_SLACK_USER_ID) return null; // owner-only
+  if (event.type !== "message") {
+    console.log("[slack] skip: not a message event, type=%s", event.type);
+    return null;
+  }
+  if (event.channel_type !== "im") {
+    console.log("[slack] skip: not a DM, channel_type=%s", event.channel_type);
+    return null;
+  }
+  if (event.bot_id) {
+    console.log("[slack] skip: bot_id present (%s)", event.bot_id);
+    return null;
+  }
+  if (event.user !== env.OWNER_SLACK_USER_ID) {
+    console.log(
+      "[slack] skip: user mismatch — got=%s expected=%s",
+      event.user,
+      env.OWNER_SLACK_USER_ID,
+    );
+    return null;
+  }
 
   // Allow plain messages and file-share messages. Reject everything else
   // (edits, deletes, channel joins, etc.).
   const allowedSubtypes = new Set([undefined, "file_share"]);
-  if (!allowedSubtypes.has(event.subtype)) return null;
+  if (!allowedSubtypes.has(event.subtype)) {
+    console.log("[slack] skip: unwanted subtype=%s", event.subtype);
+    return null;
+  }
 
+  console.log(
+    "[slack] accept: message from owner channel=%s ts=%s len=%d files=%d",
+    event.channel,
+    event.ts,
+    (event.text ?? "").length,
+    event.files?.length ?? 0,
+  );
   return event;
 }
 
@@ -74,9 +100,20 @@ export async function handleOwnerMessage(
     "_Drafting and send-as-you features come online in the next steps._",
   ].join("\n");
 
-  await getBotClient().chat.postMessage({
-    channel: event.channel,
-    text: reply,
-    // Reply in the same DM (no thread) so the conversation feels natural.
-  });
+  console.log("[slack] posting reply to channel=%s", event.channel);
+  try {
+    const result = await getBotClient().chat.postMessage({
+      channel: event.channel,
+      text: reply,
+      // Reply in the same DM (no thread) so the conversation feels natural.
+    });
+    console.log(
+      "[slack] reply posted ok=%s ts=%s",
+      result.ok,
+      result.ts,
+    );
+  } catch (err) {
+    console.error("[slack] chat.postMessage failed", err);
+    throw err;
+  }
 }

@@ -46,6 +46,10 @@ export async function POST(req: Request) {
   // 3) Real event callbacks. We ack within 3s by responding immediately
   // and doing the work via `after()`.
   if (payload.type === "event_callback") {
+    console.log(
+      "[slack] event_callback received event_id=%s",
+      (payload as { event_id?: string }).event_id,
+    );
     const envelope = payload as Parameters<typeof pickActionableMessage>[0];
     const event = pickActionableMessage(envelope);
 
@@ -58,6 +62,8 @@ export async function POST(req: Request) {
         }
       });
     }
+  } else {
+    console.log("[slack] unknown payload type=%s", payload.type);
   }
 
   return new NextResponse("ok");
