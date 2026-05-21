@@ -1,14 +1,15 @@
 import { getBotClient } from "./slack";
 import { env } from "./env";
 import { identifyRecipient } from "./recipient";
-import { STAFF, type StaffMember } from "./roster";
+import { STAFF, findStaffById, type StaffMember } from "./roster";
 import { draftMessage } from "./draft";
+import {
+  buildDraftBlocks,
+  buildSupersededBlocks,
+  DRAFT_METADATA_EVENT_TYPE,
+  type DraftMetadata,
+} from "./slack-blocks";
 
-/**
- * Shape of a Slack `message` event we care about. We don't import the full
- * @slack/web-api types here because Events API event payloads aren't quite
- * the same shape as Web API request/response types.
- */
 type SlackMessageEvent = {
   type: "message";
   channel: string;
@@ -27,10 +28,6 @@ type SlackEventEnvelope = {
   event: SlackMessageEvent;
 };
 
-/**
- * Decide whether an incoming Slack event should be processed at all.
- * Returns `null` if we should ignore it, otherwise returns the event.
- */
 export function pickActionableMessage(
   envelope: SlackEventEnvelope,
 ): SlackMessageEvent | null {
@@ -57,8 +54,6 @@ export function pickActionableMessage(
     return null;
   }
 
-  // Allow plain messages and file-share messages. Reject everything else
-  // (edits, deletes, channel joins, etc.).
   const allowedSubtypes = new Set([undefined, "file_share"]);
   if (!allowedSubtypes.has(event.subtype)) {
     console.log("[slack] skip: unwanted subtype=%s", event.subtype);
@@ -76,10 +71,10 @@ export function pickActionableMessage(
 }
 
 /**
- * Step 4: identify recipient, then draft a polished message via Claude
- * (routed through Vercel's AI Gateway). The draft is posted back to the
- * owner's DM with the bot. Iteration buttons (Send / Revise / Cancel)
- * come in the next step.
+ * Top-level DM handler. Routes to:
+ *  - revision flow, if the most recent bot message in the DM is an
+ *    outstanding draft
+ *  - fresh draft flow, otherwise
  */
 export async function handleOwnerMessage(
   event: SlackMessageEvent,
@@ -87,9 +82,34 @@ export async function handleOwnerMessage(
   const text = (event.text ?? "").trim();
   const fileCount = event.files?.length ?? 0;
 
+  const outstandingDraft = await findOutstandingDraft({
+    channel: event.channel,
+    currentMessageTs: event.ts,
+  });
+
+  if (outstandingDraft) {
+    await handleRevision({
+      event,
+      revisionText: text,
+      outstanding: outstandingDraft,
+    });
+    return;
+  }
+
+  await handleFreshDraft({ event, text, fileCount });
+}
+
+async function handleFreshDraft({
+  event,
+  text,
+  fileCount,
+}: {
+  event: SlackMessageEvent;
+  text: string;
+  fileCount: number;
+}) {
   const match = identifyRecipient(text);
 
-  // No recipient (or ambiguous) — ask the owner to clarify.
   if (match.kind !== "found") {
     await postPlain({
       channel: event.channel,
@@ -98,13 +118,11 @@ export async function handleOwnerMessage(
     return;
   }
 
-  // Recipient found. Acknowledge immediately so the user knows we're on it.
   await postPlain({
     channel: event.channel,
     text: `:writing_hand: Drafting a message for *${match.person.name}*...`,
   });
 
-  // Generate the draft. If anything blows up, surface a friendly error.
   let draft: string;
   try {
     draft = await draftMessage({
@@ -122,13 +140,150 @@ export async function handleOwnerMessage(
     return;
   }
 
-  await postDraft({
+  await postDraftWithButtons({
     channel: event.channel,
     recipient: match.person,
+    originalInput: text,
     draft,
-    fileCount,
+    attachmentCount: fileCount,
   });
 }
+
+async function handleRevision({
+  event,
+  revisionText,
+  outstanding,
+}: {
+  event: SlackMessageEvent;
+  revisionText: string;
+  outstanding: OutstandingDraft;
+}) {
+  if (!revisionText) {
+    // E.g. the owner sent only a photo with no text. Treat as a new
+    // request rather than a revision — we have no instructions to apply.
+    await postPlain({
+      channel: event.channel,
+      text:
+        ":thinking_face: I see an attachment but no instructions. " +
+        "If you want to revise the previous draft, tell me what to change.",
+    });
+    return;
+  }
+
+  const recipient = findStaffById(outstanding.recipientId);
+  if (!recipient) {
+    // Should be impossible, but be safe.
+    await postPlain({
+      channel: event.channel,
+      text:
+        ":warning: Couldn't find that staff member in the roster anymore. " +
+        "Start a new draft and mention them by name.",
+    });
+    return;
+  }
+
+  await postPlain({
+    channel: event.channel,
+    text: `:writing_hand: Revising the draft for *${recipient.name}*...`,
+  });
+
+  let newDraft: string;
+  try {
+    newDraft = await draftMessage({
+      rawInput: outstanding.originalInput,
+      recipient,
+      previousDraft: outstanding.draft,
+      revisionInstructions: revisionText,
+    });
+  } catch (err) {
+    console.error("[draft] revision failed", err);
+    await postPlain({
+      channel: event.channel,
+      text: `:warning: Sorry, couldn't revise the draft. ${
+        err instanceof Error ? `(${err.message})` : ""
+      }`,
+    });
+    return;
+  }
+
+  // Mark the prior draft message as superseded (visually struck through).
+  await getBotClient().chat.update({
+    channel: event.channel,
+    ts: outstanding.messageTs,
+    text: `~Earlier draft to ${recipient.name}~ — revised below.`,
+    blocks: buildSupersededBlocks({ recipientName: recipient.name }),
+    // Drop metadata so future history scans don't treat this as outstanding.
+    metadata: {
+      event_type: "staff_bot.superseded",
+      event_payload: {},
+    },
+  });
+
+  await postDraftWithButtons({
+    channel: event.channel,
+    recipient,
+    originalInput: outstanding.originalInput,
+    draft: newDraft,
+    attachmentCount: outstanding.attachmentCount,
+  });
+}
+
+/* -------------------------------------------------------------------------- */
+/*                          History lookup for revisions                      */
+/* -------------------------------------------------------------------------- */
+
+type OutstandingDraft = DraftMetadata & {
+  messageTs: string;
+};
+
+/**
+ * Look at the recent DM history and find the most recent bot message
+ * that is still an outstanding draft (i.e., not yet sent, cancelled, or
+ * superseded). If found, the owner's incoming message will be treated as
+ * revision instructions for it.
+ */
+async function findOutstandingDraft({
+  channel,
+  currentMessageTs,
+}: {
+  channel: string;
+  currentMessageTs: string;
+}): Promise<OutstandingDraft | null> {
+  try {
+    const history = await getBotClient().conversations.history({
+      channel,
+      limit: 10,
+      include_all_metadata: true,
+    });
+
+    // newest first
+    for (const msg of history.messages ?? []) {
+      if (msg.ts === currentMessageTs) continue; // skip the user message we're processing
+      // We only consider the most recent bot message. If the latest bot
+      // message isn't a draft (e.g., it's a "sent" or "cancelled"
+      // confirmation), there's no outstanding draft to revise.
+      if (!msg.bot_id) continue;
+      if (
+        msg.metadata?.event_type === DRAFT_METADATA_EVENT_TYPE &&
+        msg.metadata?.event_payload
+      ) {
+        const payload = msg.metadata.event_payload as unknown as DraftMetadata;
+        return { ...payload, messageTs: msg.ts! };
+      }
+      // Latest bot message isn't a draft → no outstanding draft.
+      return null;
+    }
+  } catch (err) {
+    console.error("[slack] conversations.history failed", err);
+    // On failure, fall back to "no outstanding draft" so we never block
+    // the owner. Worst case: they need to re-mention the recipient.
+  }
+  return null;
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                  Posting                                   */
+/* -------------------------------------------------------------------------- */
 
 async function postPlain({
   channel,
@@ -140,37 +295,46 @@ async function postPlain({
   await getBotClient().chat.postMessage({ channel, text });
 }
 
-async function postDraft({
+async function postDraftWithButtons({
   channel,
   recipient,
+  originalInput,
   draft,
-  fileCount,
+  attachmentCount,
 }: {
   channel: string;
   recipient: StaffMember;
+  originalInput: string;
   draft: string;
-  fileCount: number;
+  attachmentCount: number;
 }): Promise<void> {
-  const attachmentNote =
-    fileCount > 0
-      ? `\n\n_(${fileCount} attachment${
-          fileCount === 1 ? "" : "s"
-        } will be included when sending.)_`
-      : "";
-  const body = [
-    `Here's a draft to *${recipient.name}*:`,
-    "",
-    "```",
+  const metadata: DraftMetadata = {
+    recipientId: recipient.slackUserId,
+    recipientName: recipient.name,
+    originalInput,
     draft,
-    "```",
-    attachmentNote,
-    "",
-    "_(Send / revise buttons come in the next step. For now, reply with feedback and I'll re-draft on the next message.)_",
-  ]
-    .filter(Boolean)
-    .join("\n");
+    attachmentCount,
+  };
 
-  await getBotClient().chat.postMessage({ channel, text: body });
+  await getBotClient().chat.postMessage({
+    channel,
+    text: `Draft to ${recipient.name}: ${draft}`, // fallback for notifications
+    blocks: buildDraftBlocks({
+      recipientName: recipient.name,
+      draft,
+      attachmentCount,
+    }),
+    metadata: {
+      event_type: DRAFT_METADATA_EVENT_TYPE,
+      event_payload: {
+        recipientId: metadata.recipientId,
+        recipientName: metadata.recipientName,
+        originalInput: metadata.originalInput,
+        draft: metadata.draft,
+        attachmentCount: metadata.attachmentCount,
+      },
+    },
+  });
 }
 
 function buildClarifyReply({
@@ -192,14 +356,13 @@ function buildClarifyReply({
     return [
       `:thinking_face: I matched more than one person: ${names}.`,
       "",
-      "Reply with just the first name and I'll re-draft.",
+      "Reply with just the first name and I'll draft.",
       attachmentNote,
     ]
       .filter(Boolean)
       .join("\n");
   }
 
-  // match.kind === "none"
   const allNames = STAFF.map((s) => `*${s.name}*`).join(", ");
   return [
     ":question: I'm not sure who this is for.",

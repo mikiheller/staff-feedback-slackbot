@@ -1,4 +1,4 @@
-import { generateText } from "ai";
+import { generateText, type ModelMessage } from "ai";
 import type { StaffMember } from "./roster";
 
 /**
@@ -37,21 +37,46 @@ const MODEL_ID = "anthropic/claude-sonnet-4.6";
 export type DraftInput = {
   rawInput: string;
   recipient: StaffMember;
+  /** Set when the owner is iterating on an existing draft. */
+  previousDraft?: string;
+  /** The owner's revision instructions, e.g. "shorter", "drop the sign-off". */
+  revisionInstructions?: string;
 };
 
 export async function draftMessage({
   rawInput,
   recipient,
+  previousDraft,
+  revisionInstructions,
 }: DraftInput): Promise<string> {
   const system = SYSTEM_PROMPT.replaceAll(
     "{RECIPIENT_NAME}",
     recipient.name,
   );
 
+  // Fresh draft — no prior conversation context.
+  if (!previousDraft || !revisionInstructions) {
+    const result = await generateText({
+      model: MODEL_ID,
+      system,
+      prompt: rawInput,
+    });
+    return result.text.trim();
+  }
+
+  // Revision — give the model the original request, its prior draft, and
+  // the owner's change request as a conversational exchange. This is the
+  // natural way to feed iterative edits to an LLM.
+  const messages: ModelMessage[] = [
+    { role: "user", content: rawInput },
+    { role: "assistant", content: previousDraft },
+    { role: "user", content: revisionInstructions },
+  ];
+
   const result = await generateText({
     model: MODEL_ID,
     system,
-    prompt: rawInput,
+    messages,
   });
 
   return result.text.trim();
