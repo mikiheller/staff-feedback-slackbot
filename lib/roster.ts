@@ -44,6 +44,11 @@ export const STAFF: readonly StaffMember[] = [
     slackUserId: "U080WKTJMKM",
     aliases: ["samantha"],
   },
+  {
+    name: "Jake",
+    slackUserId: "U07PP9G968M",
+    aliases: ["jake"],
+  },
 ] as const;
 
 export function findStaffById(slackUserId: string): StaffMember | undefined {
