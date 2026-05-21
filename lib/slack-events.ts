@@ -6,8 +6,8 @@ import { draftMessage } from "./draft";
 import {
   buildDraftBlocks,
   buildSupersededBlocks,
-  DRAFT_METADATA_EVENT_TYPE,
-  type DraftMetadata,
+  extractDraftStateFromBlocks,
+  type DraftState,
 } from "./slack-blocks";
 
 type SlackMessageEvent = {
@@ -207,16 +207,13 @@ async function handleRevision({
   }
 
   // Mark the prior draft message as superseded (visually struck through).
+  // Note: this update removes the send_draft action button, so subsequent
+  // history scans won't pick this message up as outstanding.
   await getBotClient().chat.update({
     channel: event.channel,
     ts: outstanding.messageTs,
     text: `~Earlier draft to ${recipient.name}~ — revised below.`,
     blocks: buildSupersededBlocks({ recipientName: recipient.name }),
-    // Drop metadata so future history scans don't treat this as outstanding.
-    metadata: {
-      event_type: "staff_bot.superseded",
-      event_payload: {},
-    },
   });
 
   await postDraftWithButtons({
@@ -232,7 +229,7 @@ async function handleRevision({
 /*                          History lookup for revisions                      */
 /* -------------------------------------------------------------------------- */
 
-type OutstandingDraft = DraftMetadata & {
+type OutstandingDraft = DraftState & {
   messageTs: string;
 };
 
@@ -241,6 +238,9 @@ type OutstandingDraft = DraftMetadata & {
  * that is still an outstanding draft (i.e., not yet sent, cancelled, or
  * superseded). If found, the owner's incoming message will be treated as
  * revision instructions for it.
+ *
+ * We identify a draft message by the presence of a `send_draft` action
+ * button in its blocks — and we recover state from that button's `value`.
  */
 async function findOutstandingDraft({
   channel,
@@ -253,24 +253,20 @@ async function findOutstandingDraft({
     const history = await getBotClient().conversations.history({
       channel,
       limit: 10,
-      include_all_metadata: true,
     });
 
     // newest first
     for (const msg of history.messages ?? []) {
-      if (msg.ts === currentMessageTs) continue; // skip the user message we're processing
-      // We only consider the most recent bot message. If the latest bot
+      if (msg.ts === currentMessageTs) continue; // skip user message
+      // Only consider the most recent bot message. If the latest bot
       // message isn't a draft (e.g., it's a "sent" or "cancelled"
-      // confirmation), there's no outstanding draft to revise.
+      // confirmation, which lacks send_draft buttons), there's no
+      // outstanding draft to revise.
       if (!msg.bot_id) continue;
-      if (
-        msg.metadata?.event_type === DRAFT_METADATA_EVENT_TYPE &&
-        msg.metadata?.event_payload
-      ) {
-        const payload = msg.metadata.event_payload as unknown as DraftMetadata;
-        return { ...payload, messageTs: msg.ts! };
+      const state = extractDraftStateFromBlocks(msg.blocks);
+      if (state) {
+        return { ...state, messageTs: msg.ts! };
       }
-      // Latest bot message isn't a draft → no outstanding draft.
       return null;
     }
   } catch (err) {
@@ -308,7 +304,7 @@ async function postDraftWithButtons({
   draft: string;
   attachmentCount: number;
 }): Promise<void> {
-  const metadata: DraftMetadata = {
+  const state: DraftState = {
     recipientId: recipient.slackUserId,
     recipientName: recipient.name,
     originalInput,
@@ -319,21 +315,7 @@ async function postDraftWithButtons({
   await getBotClient().chat.postMessage({
     channel,
     text: `Draft to ${recipient.name}: ${draft}`, // fallback for notifications
-    blocks: buildDraftBlocks({
-      recipientName: recipient.name,
-      draft,
-      attachmentCount,
-    }),
-    metadata: {
-      event_type: DRAFT_METADATA_EVENT_TYPE,
-      event_payload: {
-        recipientId: metadata.recipientId,
-        recipientName: metadata.recipientName,
-        originalInput: metadata.originalInput,
-        draft: metadata.draft,
-        attachmentCount: metadata.attachmentCount,
-      },
-    },
+    blocks: buildDraftBlocks({ state }),
   });
 }
 

@@ -8,7 +8,8 @@ import {
   ACTION_SEND_DRAFT,
   buildCancelledBlocks,
   buildSentBlocks,
-  type DraftMetadata,
+  unpackStateFromButtonValue,
+  type DraftState,
 } from "@/lib/slack-blocks";
 
 export const runtime = "nodejs";
@@ -19,13 +20,9 @@ type BlockActionsPayload = {
   channel: { id: string };
   message: {
     ts: string;
-    metadata?: {
-      event_type?: string;
-      event_payload?: Record<string, unknown>;
-    };
+    blocks?: unknown[];
   };
   actions: Array<{ action_id: string; value?: string }>;
-  response_url?: string;
 };
 
 export async function POST(req: Request) {
@@ -72,13 +69,22 @@ export async function POST(req: Request) {
   const action = payload.actions[0];
   if (!action) return new NextResponse("ok");
 
+  // The button's `value` is the JSON-encoded draft state we wrote there.
+  const state = unpackStateFromButtonValue(action.value);
+  console.log(
+    "[interactivity] action=%s ts=%s stateOk=%s",
+    action.action_id,
+    payload.message.ts,
+    state !== null,
+  );
+
   // Slack expects a 200 within 3s. Do the actual work via after().
   after(async () => {
     try {
       if (action.action_id === ACTION_SEND_DRAFT) {
-        await handleSend(payload);
+        await handleSend({ payload, state });
       } else if (action.action_id === ACTION_CANCEL_DRAFT) {
-        await handleCancel(payload);
+        await handleCancel({ payload, state });
       } else {
         console.log(
           "[interactivity] unknown action_id=%s",
@@ -93,32 +99,27 @@ export async function POST(req: Request) {
   return new NextResponse("ok");
 }
 
-function extractDraftMetadata(
-  payload: BlockActionsPayload,
-): DraftMetadata | null {
-  const md = payload.message.metadata;
-  if (!md || md.event_type !== "staff_bot.draft" || !md.event_payload) {
-    return null;
-  }
-  return md.event_payload as unknown as DraftMetadata;
-}
-
-async function handleSend(payload: BlockActionsPayload): Promise<void> {
-  const meta = extractDraftMetadata(payload);
-  if (!meta) {
-    await postEphemeralLike({
+async function handleSend({
+  payload,
+  state,
+}: {
+  payload: BlockActionsPayload;
+  state: DraftState | null;
+}): Promise<void> {
+  if (!state) {
+    await getBotClient().chat.postMessage({
       channel: payload.channel.id,
-      messageTs: payload.message.ts,
+      thread_ts: payload.message.ts,
       text:
-        ":warning: Couldn't find the draft data on this message. " +
+        ":warning: Couldn't read the draft data on this message. " +
         "Start a new draft.",
     });
     return;
   }
 
   const result = await sendAsOwner({
-    recipientId: meta.recipientId,
-    text: meta.draft,
+    recipientId: state.recipientId,
+    text: state.draft,
   });
 
   if (!result.ok) {
@@ -131,59 +132,34 @@ async function handleSend(payload: BlockActionsPayload): Promise<void> {
     return;
   }
 
-  // Swap the draft message in the owner's DM for a "sent ✓" version, and
-  // clear the metadata so future replies don't get treated as revisions.
+  // Swap the draft message in the owner's DM for a "sent ✓" version. The
+  // new blocks have no action buttons, which is what marks this draft as
+  // no longer outstanding for the revision-detection logic.
   await getBotClient().chat.update({
     channel: payload.channel.id,
     ts: payload.message.ts,
-    text: `Sent to ${meta.recipientName}`,
+    text: `Sent to ${state.recipientName}`,
     blocks: buildSentBlocks({
-      recipientName: meta.recipientName,
-      draft: meta.draft,
+      recipientName: state.recipientName,
+      draft: state.draft,
       sentAt: new Date(),
     }),
-    metadata: {
-      event_type: "staff_bot.sent",
-      event_payload: {
-        recipientId: meta.recipientId,
-        recipientName: meta.recipientName,
-      },
-    },
   });
 }
 
-async function handleCancel(payload: BlockActionsPayload): Promise<void> {
-  const meta = extractDraftMetadata(payload);
-  const recipientName = meta?.recipientName ?? "the recipient";
+async function handleCancel({
+  payload,
+  state,
+}: {
+  payload: BlockActionsPayload;
+  state: DraftState | null;
+}): Promise<void> {
+  const recipientName = state?.recipientName ?? "the recipient";
 
   await getBotClient().chat.update({
     channel: payload.channel.id,
     ts: payload.message.ts,
     text: `Draft to ${recipientName} cancelled.`,
     blocks: buildCancelledBlocks({ recipientName }),
-    metadata: {
-      event_type: "staff_bot.cancelled",
-      event_payload: {},
-    },
-  });
-}
-
-/**
- * Post a contextual note attached to the draft message. We use a regular
- * threaded reply because chat.postEphemeral can be flaky in DMs.
- */
-async function postEphemeralLike({
-  channel,
-  messageTs,
-  text,
-}: {
-  channel: string;
-  messageTs: string;
-  text: string;
-}): Promise<void> {
-  await getBotClient().chat.postMessage({
-    channel,
-    thread_ts: messageTs,
-    text,
   });
 }

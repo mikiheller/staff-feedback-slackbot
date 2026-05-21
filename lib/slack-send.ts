@@ -44,15 +44,6 @@ export async function sendAsOwner({
     const posted = await user.chat.postMessage({
       channel: dmChannelId,
       text,
-      // Marker so we can recognize messages we've sent on the owner's
-      // behalf if we ever want to (e.g. for debugging). Doesn't show up
-      // in the UI for the recipient.
-      metadata: {
-        event_type: "staff_bot.sent_as_owner",
-        event_payload: {
-          via: "staff-feedback-slackbot",
-        },
-      },
     });
     if (!posted.ok || !posted.ts) {
       return {
