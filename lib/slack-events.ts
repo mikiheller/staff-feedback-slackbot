@@ -1,5 +1,7 @@
 import { getBotClient } from "./slack";
 import { env } from "./env";
+import { identifyRecipient } from "./recipient";
+import { STAFF } from "./roster";
 
 /**
  * Shape of a Slack `message` event we care about. We don't import the full
@@ -73,9 +75,11 @@ export function pickActionableMessage(
 }
 
 /**
- * For Step 2 we just echo what the owner said, plus a note that real
- * drafting features are coming. This proves the round-trip: Slack -> us
- * -> Slack -> the owner's DM with the bot.
+ * Step 3: figure out who the message is for and acknowledge.
+ *
+ * If a single staff member can be identified (by @-mention or first-name
+ * match), tell the owner who we'll draft for. If we can't tell, list the
+ * roster and ask. The actual LLM drafting comes in Step 4.
  */
 export async function handleOwnerMessage(
   event: SlackMessageEvent,
@@ -83,37 +87,71 @@ export async function handleOwnerMessage(
   const text = (event.text ?? "").trim();
   const fileCount = event.files?.length ?? 0;
 
-  const summary = [
-    text ? `> ${text.replace(/\n/g, "\n> ")}` : "_(no text)_",
-    fileCount > 0
-      ? `\n_Got ${fileCount} attachment${fileCount === 1 ? "" : "s"}._`
-      : "",
-  ]
-    .join("")
-    .trim();
-
-  const reply = [
-    ":white_check_mark: Got it. Here's what I heard:",
-    "",
-    summary,
-    "",
-    "_Drafting and send-as-you features come online in the next steps._",
-  ].join("\n");
+  const match = identifyRecipient(text);
+  const reply = buildAckReply({ match, fileCount });
 
   console.log("[slack] posting reply to channel=%s", event.channel);
   try {
     const result = await getBotClient().chat.postMessage({
       channel: event.channel,
       text: reply,
-      // Reply in the same DM (no thread) so the conversation feels natural.
     });
-    console.log(
-      "[slack] reply posted ok=%s ts=%s",
-      result.ok,
-      result.ts,
-    );
+    console.log("[slack] reply posted ok=%s ts=%s", result.ok, result.ts);
   } catch (err) {
     console.error("[slack] chat.postMessage failed", err);
     throw err;
   }
+}
+
+function buildAckReply({
+  match,
+  fileCount,
+}: {
+  match: ReturnType<typeof identifyRecipient>;
+  fileCount: number;
+}): string {
+  const attachmentNote =
+    fileCount > 0
+      ? `_(${fileCount} attachment${
+          fileCount === 1 ? "" : "s"
+        } noted — I'll include them when sending.)_`
+      : "";
+  const comingSoon =
+    "_Drafting and send-as-you come online in the next step._";
+
+  if (match.kind === "found") {
+    return [
+      `:white_check_mark: Got it — I'll work on this message for *${match.person.name}*.`,
+      attachmentNote,
+      "",
+      comingSoon,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  if (match.kind === "ambiguous") {
+    const names = match.candidates.map((c) => `*${c.name}*`).join(", ");
+    return [
+      `:thinking_face: I matched more than one person: ${names}.`,
+      "",
+      "Reply with just the first name and I'll pick up from there.",
+      attachmentNote,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  // match.kind === "none"
+  const allNames = STAFF.map((s) => `*${s.name}*`).join(", ");
+  return [
+    ":question: I'm not sure who this is for.",
+    "",
+    `Staff I know: ${allNames}.`,
+    "",
+    "Mention one of them by name (or @-mention them) and I'll get drafting.",
+    attachmentNote,
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
