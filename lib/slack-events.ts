@@ -1,7 +1,8 @@
 import { getBotClient } from "./slack";
 import { env } from "./env";
 import { identifyRecipient } from "./recipient";
-import { STAFF } from "./roster";
+import { STAFF, type StaffMember } from "./roster";
+import { draftMessage } from "./draft";
 
 /**
  * Shape of a Slack `message` event we care about. We don't import the full
@@ -75,11 +76,10 @@ export function pickActionableMessage(
 }
 
 /**
- * Step 3: figure out who the message is for and acknowledge.
- *
- * If a single staff member can be identified (by @-mention or first-name
- * match), tell the owner who we'll draft for. If we can't tell, list the
- * roster and ask. The actual LLM drafting comes in Step 4.
+ * Step 4: identify recipient, then draft a polished message via Claude
+ * (routed through Vercel's AI Gateway). The draft is posted back to the
+ * owner's DM with the bot. Iteration buttons (Send / Revise / Cancel)
+ * come in the next step.
  */
 export async function handleOwnerMessage(
   event: SlackMessageEvent,
@@ -88,22 +88,92 @@ export async function handleOwnerMessage(
   const fileCount = event.files?.length ?? 0;
 
   const match = identifyRecipient(text);
-  const reply = buildAckReply({ match, fileCount });
 
-  console.log("[slack] posting reply to channel=%s", event.channel);
-  try {
-    const result = await getBotClient().chat.postMessage({
+  // No recipient (or ambiguous) — ask the owner to clarify.
+  if (match.kind !== "found") {
+    await postPlain({
       channel: event.channel,
-      text: reply,
+      text: buildClarifyReply({ match, fileCount }),
     });
-    console.log("[slack] reply posted ok=%s ts=%s", result.ok, result.ts);
-  } catch (err) {
-    console.error("[slack] chat.postMessage failed", err);
-    throw err;
+    return;
   }
+
+  // Recipient found. Acknowledge immediately so the user knows we're on it.
+  await postPlain({
+    channel: event.channel,
+    text: `:writing_hand: Drafting a message for *${match.person.name}*...`,
+  });
+
+  // Generate the draft. If anything blows up, surface a friendly error.
+  let draft: string;
+  try {
+    draft = await draftMessage({
+      rawInput: text,
+      recipient: match.person,
+    });
+  } catch (err) {
+    console.error("[draft] generation failed", err);
+    await postPlain({
+      channel: event.channel,
+      text: `:warning: Sorry, I couldn't generate the draft. ${
+        err instanceof Error ? `(${err.message})` : ""
+      }`,
+    });
+    return;
+  }
+
+  await postDraft({
+    channel: event.channel,
+    recipient: match.person,
+    draft,
+    fileCount,
+  });
 }
 
-function buildAckReply({
+async function postPlain({
+  channel,
+  text,
+}: {
+  channel: string;
+  text: string;
+}): Promise<void> {
+  await getBotClient().chat.postMessage({ channel, text });
+}
+
+async function postDraft({
+  channel,
+  recipient,
+  draft,
+  fileCount,
+}: {
+  channel: string;
+  recipient: StaffMember;
+  draft: string;
+  fileCount: number;
+}): Promise<void> {
+  const attachmentNote =
+    fileCount > 0
+      ? `\n\n_(${fileCount} attachment${
+          fileCount === 1 ? "" : "s"
+        } will be included when sending.)_`
+      : "";
+  const body = [
+    `Here's a draft to *${recipient.name}*:`,
+    "",
+    "```",
+    draft,
+    "```",
+    attachmentNote,
+    "",
+    "_(Send / revise buttons come in the next step. For now, reply with feedback and I'll re-draft on the next message.)_",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  await getBotClient().chat.postMessage({ channel, text: body });
+}
+
+function buildClarifyReply({
   match,
   fileCount,
 }: {
@@ -116,26 +186,13 @@ function buildAckReply({
           fileCount === 1 ? "" : "s"
         } noted — I'll include them when sending.)_`
       : "";
-  const comingSoon =
-    "_Drafting and send-as-you come online in the next step._";
-
-  if (match.kind === "found") {
-    return [
-      `:white_check_mark: Got it — I'll work on this message for *${match.person.name}*.`,
-      attachmentNote,
-      "",
-      comingSoon,
-    ]
-      .filter(Boolean)
-      .join("\n");
-  }
 
   if (match.kind === "ambiguous") {
     const names = match.candidates.map((c) => `*${c.name}*`).join(", ");
     return [
       `:thinking_face: I matched more than one person: ${names}.`,
       "",
-      "Reply with just the first name and I'll pick up from there.",
+      "Reply with just the first name and I'll re-draft.",
       attachmentNote,
     ]
       .filter(Boolean)
@@ -149,7 +206,7 @@ function buildAckReply({
     "",
     `Staff I know: ${allNames}.`,
     "",
-    "Mention one of them by name (or @-mention them) and I'll get drafting.",
+    "Mention one of them by name (or @-mention them) and I'll draft.",
     attachmentNote,
   ]
     .filter(Boolean)

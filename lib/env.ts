@@ -21,7 +21,4 @@ export const env = {
   get OWNER_SLACK_USER_ID() {
     return required("OWNER_SLACK_USER_ID");
   },
-  get ANTHROPIC_API_KEY() {
-    return required("ANTHROPIC_API_KEY");
-  },
 };
