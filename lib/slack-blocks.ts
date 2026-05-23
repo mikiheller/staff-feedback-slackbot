@@ -241,15 +241,32 @@ export function buildCancelledBlocks({
 /** Replaces a draft message after the owner asks for a revision. */
 export function buildSupersededBlocks({
   recipientName,
+  draft,
 }: {
   recipientName: string;
+  draft: string;
 }): KnownBlock[] {
+  // Wrap each line in `~...~` so Slack renders the prior draft as
+  // struck-through. Tildes inside the draft itself are uncommon in
+  // English text; we accept that breaking edge case for simplicity.
+  const struckDraft = draft
+    .split("\n")
+    .map((line) => (line.length > 0 ? `> ~${line}~` : ">"))
+    .join("\n");
+
   return [
     {
       type: "section",
       text: {
         type: "mrkdwn",
-        text: `_~Earlier draft to ${recipientName}~ — revised below._`,
+        text: `_Earlier draft to ${recipientName} — revised below:_`,
+      },
+    },
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: struckDraft,
       },
     },
   ];

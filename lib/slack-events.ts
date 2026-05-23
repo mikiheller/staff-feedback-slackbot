@@ -188,17 +188,19 @@ async function markDraftSuperseded({
   channel,
   ts,
   recipientName,
+  draft,
 }: {
   channel: string;
   ts: string;
   recipientName: string;
+  draft: string;
 }): Promise<void> {
   try {
     await getBotClient().chat.update({
       channel,
       ts,
-      text: `~Earlier draft to ${recipientName}~ — superseded.`,
-      blocks: buildSupersededBlocks({ recipientName }),
+      text: `Earlier draft to ${recipientName} — revised below.`,
+      blocks: buildSupersededBlocks({ recipientName, draft }),
     });
   } catch (err) {
     console.error("[slack] failed to supersede earlier draft", err);
@@ -270,6 +272,7 @@ async function handleRevision({
     channel: event.channel,
     ts: outstanding.messageTs,
     recipientName: recipient.name,
+    draft: outstanding.draft,
   });
 
   await postDraftWithButtons({
