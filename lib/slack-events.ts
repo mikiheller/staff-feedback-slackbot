@@ -9,6 +9,7 @@ import {
   extractDraftStateFromBlocks,
   type DraftState,
 } from "./slack-blocks";
+import { classifyIntent } from "./intent";
 
 type SlackMessageEvent = {
   type: "message";
@@ -73,17 +74,15 @@ export function pickActionableMessage(
 /**
  * Top-level DM handler. The decision tree:
  *
- *   1. If the message names a recipient (by @-mention or first-name match):
- *      → treat as a fresh draft for that recipient. Supersede any
- *        outstanding draft so the owner doesn't end up with two
- *        live drafts in the DM.
- *   2. Else, if there is an outstanding draft sitting in the DM:
- *      → treat the message as revision instructions for it.
- *   3. Else:
- *      → ask who the message is for.
+ *   1. Find all outstanding drafts in the recent DM history.
+ *   2. Ask the LLM to classify: is this new feedback, or a revision of
+ *      one of the outstanding drafts? If revise, which one?
+ *   3. Route to the appropriate flow.
  *
- * The key invariant: the moment the owner names anyone, it's a new
- * request — never an accidental revision of an unrelated draft.
+ * Multiple outstanding drafts can coexist — we don't supersede them
+ * just because a new request came in. The owner can keep multiple
+ * drafts in flight (e.g. one for Brendy, one for Patricia) and we
+ * route revisions to the right one.
  */
 export async function handleOwnerMessage(
   event: SlackMessageEvent,
@@ -91,49 +90,48 @@ export async function handleOwnerMessage(
   const text = (event.text ?? "").trim();
   const fileCount = event.files?.length ?? 0;
 
-  const recipientMatch = identifyRecipient(text);
-  const outstandingDraft = await findOutstandingDraft({
+  const outstandingDrafts = await findOutstandingDrafts({
     channel: event.channel,
     currentMessageTs: event.ts,
   });
 
-  const namedSomeone =
-    recipientMatch.kind === "found" || recipientMatch.kind === "ambiguous";
+  // Classify intent. If there are no outstanding drafts, the classifier
+  // short-circuits to "new" without making an LLM call.
+  const intent = await classifyIntent({
+    text,
+    outstandingDrafts: outstandingDrafts.map((d) => ({
+      recipientName: d.recipientName,
+      draft: d.draft,
+      originalInput: d.originalInput,
+    })),
+  });
 
-  // Whenever the owner names someone, a possibly-stale outstanding
-  // draft is no longer relevant — strike it through so they know.
-  if (namedSomeone && outstandingDraft) {
-    await markDraftSuperseded({
-      channel: event.channel,
-      ts: outstandingDraft.messageTs,
-      recipientName: outstandingDraft.recipientName,
-    });
+  if (intent.kind === "revise") {
+    const target = outstandingDrafts[intent.draftIndex - 1];
+    if (target) {
+      await handleRevision({
+        event,
+        revisionText: text,
+        outstanding: target,
+      });
+      return;
+    }
+    // Fall through to the new-feedback path if the target index was bad.
+    console.warn(
+      "[slack] intent said revise draftIndex=%d but only %d outstanding — falling through to new",
+      intent.draftIndex,
+      outstandingDrafts.length,
+    );
   }
 
+  // New feedback. Now we need to figure out who it's for.
+  const recipientMatch = identifyRecipient(text);
   if (recipientMatch.kind === "found") {
     await handleFreshDraft({
       event,
       text,
       fileCount,
       recipient: recipientMatch.person,
-    });
-    return;
-  }
-
-  if (recipientMatch.kind === "ambiguous") {
-    await postPlain({
-      channel: event.channel,
-      text: buildClarifyReply({ match: recipientMatch, fileCount }),
-    });
-    return;
-  }
-
-  // No recipient named.
-  if (outstandingDraft) {
-    await handleRevision({
-      event,
-      revisionText: text,
-      outstanding: outstandingDraft,
     });
     return;
   }
@@ -265,14 +263,13 @@ async function handleRevision({
     return;
   }
 
-  // Mark the prior draft message as superseded (visually struck through).
-  // Note: this update removes the send_draft action button, so subsequent
-  // history scans won't pick this message up as outstanding.
-  await getBotClient().chat.update({
+  // Visually retire the prior draft message. This update removes its
+  // send_draft action button, so subsequent history scans won't pick
+  // this message up as outstanding.
+  await markDraftSuperseded({
     channel: event.channel,
     ts: outstanding.messageTs,
-    text: `~Earlier draft to ${recipient.name}~ — revised below.`,
-    blocks: buildSupersededBlocks({ recipientName: recipient.name }),
+    recipientName: recipient.name,
   });
 
   await postDraftWithButtons({
@@ -293,47 +290,45 @@ type OutstandingDraft = DraftState & {
 };
 
 /**
- * Look at the recent DM history and find the most recent bot message
- * that is still an outstanding draft (i.e., not yet sent, cancelled, or
- * superseded). If found, the owner's incoming message will be treated as
- * revision instructions for it.
+ * Look at the recent DM history and find ALL outstanding drafts (i.e.,
+ * bot messages still showing send_draft buttons). Returned newest-first.
  *
- * We identify a draft message by the presence of a `send_draft` action
- * button in its blocks — and we recover state from that button's `value`.
+ * Multiple drafts can be in flight at once: e.g., the owner drafted a
+ * Brendy message, then started a Patricia message before sending the
+ * Brendy one. The classifier (lib/intent.ts) decides which one — if any
+ * — a new owner message refers to.
  */
-async function findOutstandingDraft({
+async function findOutstandingDrafts({
   channel,
   currentMessageTs,
 }: {
   channel: string;
   currentMessageTs: string;
-}): Promise<OutstandingDraft | null> {
+}): Promise<OutstandingDraft[]> {
+  const drafts: OutstandingDraft[] = [];
   try {
     const history = await getBotClient().conversations.history({
       channel,
-      limit: 10,
+      // Look back further than the single-draft logic did, since multiple
+      // drafts can pile up. We still cap to keep latency low and avoid
+      // bloating the classifier prompt.
+      limit: 30,
     });
 
-    // newest first
     for (const msg of history.messages ?? []) {
-      if (msg.ts === currentMessageTs) continue; // skip user message
-      // Only consider the most recent bot message. If the latest bot
-      // message isn't a draft (e.g., it's a "sent" or "cancelled"
-      // confirmation, which lacks send_draft buttons), there's no
-      // outstanding draft to revise.
+      if (msg.ts === currentMessageTs) continue;
       if (!msg.bot_id) continue;
       const state = extractDraftStateFromBlocks(msg.blocks);
       if (state) {
-        return { ...state, messageTs: msg.ts! };
+        drafts.push({ ...state, messageTs: msg.ts! });
       }
-      return null;
     }
   } catch (err) {
     console.error("[slack] conversations.history failed", err);
-    // On failure, fall back to "no outstanding draft" so we never block
+    // On failure, fall back to "no outstanding drafts" so we never block
     // the owner. Worst case: they need to re-mention the recipient.
   }
-  return null;
+  return drafts;
 }
 
 /* -------------------------------------------------------------------------- */
