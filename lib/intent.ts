@@ -3,133 +3,74 @@ import { z } from "zod";
 import { STAFF, type StaffMember } from "./roster";
 
 /**
- * Classifier that decides what the owner wants:
+ * Given a top-level message from the owner, identify the *intended*
+ * recipients of the feedback (people the message is FOR), pulling only
+ * from the staff roster. People mentioned for context (e.g. "while
+ * Grace is out", "Jake will pitch in") must NOT be returned.
  *
- *   - "new":    a new piece of feedback. Returns the *intended*
- *               recipients (people the message is FOR, not just
- *               anyone mentioned in passing).
- *   - "revise": an instruction to edit an existing outstanding draft,
- *               with a 1-based index into the outstanding-drafts list.
+ * Returns an empty array if the bot can't tell. The caller should ask.
  *
- * Run on Claude Haiku for ~500ms latency.
+ * Runs on Claude Haiku for ~500ms latency.
  */
 
-export type OutstandingDraftSummary = {
-  recipientNames: string[];
-  draft: string;
-  /** Original raw input that produced the current draft, helps the
-   * classifier decide whether new text is "more of the same" or different. */
-  originalInput: string;
-};
-
-export type IntentResult =
-  | { kind: "new"; recipients: StaffMember[] }
-  | { kind: "revise"; draftIndex: number };
-
-const RawIntentSchema = z.discriminatedUnion("kind", [
-  z.object({
-    kind: z.literal("new"),
-    recipientNames: z.array(z.string()),
-  }),
-  z.object({
-    kind: z.literal("revise"),
-    draftIndex: z.number().int().min(1),
-  }),
-]);
+const RecipientNamesSchema = z.object({
+  recipientNames: z.array(z.string()),
+});
 
 function buildSystemPrompt(): string {
   const rosterList = STAFF.map((s) => `- ${s.name}`).join("\n");
-  return `You are routing messages from a household owner to a draft assistant. The owner has a roster of staff and family members; they sometimes have one or more "outstanding drafts" — messages they've already drafted but haven't yet sent.
+  return `You are helping route a household owner's draft request to the right person.
 
-Your job, when a new message comes in, is to decide:
-
-1. Is this a NEW piece of feedback the owner wants drafted, or a REVISION of one of the outstanding drafts?
-
-2. If NEW, who are the intended RECIPIENTS — the people the message is being SENT TO. People mentioned for context (e.g. "while Grace is out", "Jake and Miki will pitch in") are NOT recipients. Pick names ONLY from this roster:
+The owner just typed a note describing some feedback they want to give to one or more people from this roster:
 ${rosterList}
 
-3. If REVISE, which draft (1-based index)? Default to most recent (1) unless the owner clearly names a different one ("make the Brendy one shorter" when Brendy isn't the most recent).
+Your only job: identify the INTENDED recipients — the people the owner wants the message to be SENT TO — by their first name from the roster.
 
-Heuristics:
-- Short message with edit-style verbs ("shorter", "warmer", "drop the X", "less Y", "more like Z", "add X") → revise (most recent)
-- Short message naming a recipient followed by edit instructions ("for Brendy, drop the sign-off") → revise (Brendy's draft)
-- A new substantive piece of feedback or a new specific topic, even if it names a person who already has an outstanding draft → new
-- A long detailed instruction about what they want said → new
-- "I want to message X and Y about ..." → new, recipients = [X, Y] (and only X and Y; don't include other names mentioned for context)
-- If there are no outstanding drafts, the answer is always new.
+Strict rules:
+- Pick names ONLY from the roster above. If a name isn't on the roster, ignore it.
+- Distinguish between recipients and context. If the owner says "I want to message Patricia and Giuliane to coordinate while Grace is out", the recipients are [Patricia, Giuliane], NOT Grace. Grace was mentioned for context.
+- Multiple recipients are fine when they're explicitly addressed (e.g. "tell Patricia and Giuliane that...").
+- If you genuinely cannot tell, return an empty array — the system will ask the owner.
 
-Output STRICTLY one of these JSON shapes (no extra text):
-- {"kind": "new", "recipientNames": ["Patricia", "Giuliane"]}
-- {"kind": "revise", "draftIndex": 1}
+Output STRICTLY this JSON shape (no extra text):
+{"recipientNames": ["Patricia", "Giuliane"]}
 
-If you can't tell who a NEW message is for, return {"kind":"new","recipientNames":[]} and the system will ask the owner.`;
+or, when unsure:
+{"recipientNames": []}`;
 }
 
-export async function classifyIntent({
-  text,
-  outstandingDrafts,
-}: {
-  text: string;
-  outstandingDrafts: OutstandingDraftSummary[];
-}): Promise<IntentResult> {
-  // No outstanding drafts → can't be a revise. Skip the LLM call only if
-  // we don't need recipient identification — but we do, so we still call.
-  // The model is cheap and fast.
+export async function identifyRecipients(
+  text: string,
+): Promise<StaffMember[]> {
+  if (!text.trim()) return [];
 
-  const draftsList =
-    outstandingDrafts.length === 0
-      ? "(none)"
-      : outstandingDrafts
-          .map(
-            (d, i) =>
-              `[${i + 1}] To ${d.recipientNames.join(" & ")}\n  original_input: "${d.originalInput}"\n  current_draft: "${d.draft}"`,
-          )
-          .join("\n");
-
-  const userPrompt = `Outstanding drafts (most recent first):\n${draftsList}\n\nThe owner just said:\n"""\n${text}\n"""\n\nClassify.`;
-
-  let raw: z.infer<typeof RawIntentSchema>;
+  let raw: { recipientNames: string[] };
   try {
     const { output } = await generateText({
       model: "anthropic/claude-haiku-4.5",
       system: buildSystemPrompt(),
-      prompt: userPrompt,
-      output: Output.object({ schema: RawIntentSchema }),
+      prompt: text,
+      output: Output.object({ schema: RecipientNamesSchema }),
     });
     raw = output;
   } catch (err) {
-    console.error("[intent] classification failed, defaulting to empty new", err);
-    return { kind: "new", recipients: [] };
+    console.error("[intent] recipient identification failed", err);
+    return [];
   }
 
-  if (raw.kind === "revise") {
-    if (raw.draftIndex < 1 || raw.draftIndex > outstandingDrafts.length) {
-      // out-of-range index → fall back to most recent if any
-      if (outstandingDrafts.length > 0) {
-        return { kind: "revise", draftIndex: 1 };
-      }
-      // No outstanding drafts to revise → treat as new with no recipients,
-      // which makes the bot ask for clarification.
-      return { kind: "new", recipients: [] };
-    }
-    return { kind: "revise", draftIndex: raw.draftIndex };
-  }
-
-  // raw.kind === "new" — resolve names against the roster.
   const seen = new Set<string>();
   const resolved: StaffMember[] = [];
   for (const name of raw.recipientNames) {
-    const normalized = name.trim().toLowerCase();
+    const norm = name.trim().toLowerCase();
     const match = STAFF.find(
       (s) =>
-        s.name.toLowerCase() === normalized ||
-        s.aliases.some((a) => a.toLowerCase() === normalized),
+        s.name.toLowerCase() === norm ||
+        s.aliases.some((a) => a.toLowerCase() === norm),
     );
     if (match && !seen.has(match.slackUserId)) {
       seen.add(match.slackUserId);
       resolved.push(match);
     }
   }
-
-  return { kind: "new", recipients: resolved };
+  return resolved;
 }

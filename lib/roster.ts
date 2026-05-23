@@ -49,6 +49,13 @@ export const STAFF: readonly StaffMember[] = [
     slackUserId: "U07PP9G968M",
     aliases: ["jake"],
   },
+  {
+    name: "Sheryl",
+    // TODO: replace with Sheryl's actual Slack member ID. Until this
+    // is filled in, the bot can't route messages to her.
+    slackUserId: "PLACEHOLDER_SHERYL_USER_ID",
+    aliases: ["sheryl"],
+  },
 ] as const;
 
 export function findStaffById(slackUserId: string): StaffMember | undefined {

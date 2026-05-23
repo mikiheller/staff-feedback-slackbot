@@ -4,11 +4,12 @@ import { STAFF, type StaffMember } from "./roster";
 import { draftMessage } from "./draft";
 import {
   buildDraftBlocks,
-  buildSupersededBlocks,
+  destinationFromState,
   extractDraftStateFromBlocks,
   type DraftState,
 } from "./slack-blocks";
-import { classifyIntent } from "./intent";
+import { identifyRecipients } from "./intent";
+import { resolveDestination } from "./routing";
 
 type SlackMessageEvent = {
   type: "message";
@@ -17,6 +18,9 @@ type SlackMessageEvent = {
   user?: string;
   text?: string;
   ts: string;
+  /** Set when the message is part of a thread. If equal to ts, it's the
+   * thread parent. If different, it's a reply in the thread. */
+  thread_ts?: string;
   bot_id?: string;
   subtype?: string;
   files?: Array<{ id: string; name?: string; mimetype?: string }>;
@@ -32,356 +36,387 @@ export function pickActionableMessage(
   envelope: SlackEventEnvelope,
 ): SlackMessageEvent | null {
   const event = envelope.event;
-
-  if (event.type !== "message") {
-    console.log("[slack] skip: not a message event, type=%s", event.type);
-    return null;
-  }
-  if (event.channel_type !== "im") {
-    console.log("[slack] skip: not a DM, channel_type=%s", event.channel_type);
-    return null;
-  }
-  if (event.bot_id) {
-    console.log("[slack] skip: bot_id present (%s)", event.bot_id);
-    return null;
-  }
-  if (event.user !== env.OWNER_SLACK_USER_ID) {
-    console.log(
-      "[slack] skip: user mismatch — got=%s expected=%s",
-      event.user,
-      env.OWNER_SLACK_USER_ID,
-    );
-    return null;
-  }
-
+  if (event.type !== "message") return null;
+  if (event.channel_type !== "im") return null;
+  if (event.bot_id) return null;
+  if (event.user !== env.OWNER_SLACK_USER_ID) return null;
   const allowedSubtypes = new Set([undefined, "file_share"]);
-  if (!allowedSubtypes.has(event.subtype)) {
-    console.log("[slack] skip: unwanted subtype=%s", event.subtype);
-    return null;
-  }
-
-  console.log(
-    "[slack] accept: message from owner channel=%s ts=%s len=%d files=%d",
-    event.channel,
-    event.ts,
-    (event.text ?? "").length,
-    event.files?.length ?? 0,
-  );
+  if (!allowedSubtypes.has(event.subtype)) return null;
   return event;
 }
 
+/* -------------------------------------------------------------------------- */
+/*                            Top-level handler                               */
+/* -------------------------------------------------------------------------- */
+
 /**
- * Top-level DM handler.
- *
- *   1. Find all outstanding drafts in the recent DM history.
- *   2. Ask the LLM to classify the message as either new feedback (and
- *      identify the intended recipients) or a revision of one of the
- *      outstanding drafts.
- *   3. Route to the appropriate flow.
- *
- * Multiple outstanding drafts can coexist — we don't supersede them
- * just because a new request came in. The owner can have a Brendy and
- * a Patricia draft both in flight.
+ * Routes the incoming DM:
+ *   - Top-level message → new request flow (start a thread, post draft)
+ *   - Thread reply       → revision flow (find prior draft, redraft)
  */
 export async function handleOwnerMessage(
   event: SlackMessageEvent,
 ): Promise<void> {
+  const isThreadReply =
+    typeof event.thread_ts === "string" && event.thread_ts !== event.ts;
+
+  if (isThreadReply) {
+    await handleThreadReply(event);
+    return;
+  }
+  await handleNewRequest(event);
+}
+
+/* -------------------------------------------------------------------------- */
+/*                          New request (top-level)                           */
+/* -------------------------------------------------------------------------- */
+
+async function handleNewRequest(event: SlackMessageEvent): Promise<void> {
   const text = (event.text ?? "").trim();
   const fileCount = event.files?.length ?? 0;
 
-  const outstandingDrafts = await findOutstandingDrafts({
-    channel: event.channel,
-    currentMessageTs: event.ts,
-  });
-
-  const intent = await classifyIntent({
-    text,
-    outstandingDrafts: outstandingDrafts.map((d) => ({
-      recipientNames: d.recipientNames,
-      draft: d.draft,
-      originalInput: d.originalInput,
-    })),
-  });
-
-  if (intent.kind === "revise") {
-    const target = outstandingDrafts[intent.draftIndex - 1];
-    if (target) {
-      await handleRevision({
-        event,
-        revisionText: text,
-        outstanding: target,
-      });
-      return;
-    }
-    console.warn(
-      "[slack] intent said revise draftIndex=%d but only %d outstanding — falling through",
-      intent.draftIndex,
-      outstandingDrafts.length,
-    );
-  }
-
-  // New feedback path.
-  if (intent.kind === "new" && intent.recipients.length > 0) {
-    await handleFreshDraft({
-      event,
-      text,
-      fileCount,
-      recipients: intent.recipients,
+  if (!text) {
+    await postInThread({
+      channel: event.channel,
+      thread_ts: event.ts,
+      text: ":thinking_face: I see attachments but no instructions — tell me what to say and who to send it to.",
     });
     return;
   }
 
-  // No intended recipients identified.
-  await postPlain({
-    channel: event.channel,
-    text: buildClarifyReply({ fileCount }),
-  });
-}
+  const recipients = await identifyRecipients(text);
 
-async function handleFreshDraft({
-  event,
-  text,
-  fileCount,
-  recipients,
-}: {
-  event: SlackMessageEvent;
-  text: string;
-  fileCount: number;
-  recipients: StaffMember[];
-}) {
-  const namesJoined = formatNames(recipients.map((r) => r.name));
-  await postPlain({
-    channel: event.channel,
-    text: `:writing_hand: Drafting a message for *${namesJoined}*...`,
-  });
+  if (recipients.length === 0) {
+    await postInThread({
+      channel: event.channel,
+      thread_ts: event.ts,
+      text: ":thinking_face: Who's this for? Tell me the name(s) (e.g. \"Brendy\" or \"Patricia and Giuliane\") and I'll draft.",
+    });
+    return;
+  }
+
+  const routing = resolveDestination(recipients);
+  if (!routing.ok) {
+    await postInThread({
+      channel: event.channel,
+      thread_ts: event.ts,
+      text: `:warning: ${routing.message}`,
+    });
+    return;
+  }
 
   let draft: string;
   try {
-    draft = await draftMessage({
-      rawInput: text,
-      recipients,
-    });
+    draft = await draftMessage({ rawInput: text, recipients });
   } catch (err) {
     console.error("[draft] generation failed", err);
-    await postPlain({
+    await postInThread({
       channel: event.channel,
-      text: `:warning: Sorry, I couldn't generate the draft. ${
+      thread_ts: event.ts,
+      text: `:warning: Couldn't generate the draft. ${
         err instanceof Error ? `(${err.message})` : ""
       }`,
     });
     return;
   }
 
-  await postDraftWithButtons({
+  await postDraftInThread({
     channel: event.channel,
-    recipients,
-    originalInput: text,
+    thread_ts: event.ts,
     draft,
+    originalInput: text,
+    recipients,
+    destination: routing.destination,
     attachmentCount: fileCount,
   });
 }
 
-async function markDraftSuperseded({
-  channel,
-  ts,
-  recipientNames,
-  draft,
-}: {
-  channel: string;
-  ts: string;
-  recipientNames: string[];
-  draft: string;
-}): Promise<void> {
-  try {
-    await getBotClient().chat.update({
-      channel,
-      ts,
-      text: `Earlier draft to ${formatNames(recipientNames)} — revised below.`,
-      blocks: buildSupersededBlocks({ recipientNames, draft }),
-    });
-  } catch (err) {
-    console.error("[slack] failed to supersede earlier draft", err);
-  }
-}
+/* -------------------------------------------------------------------------- */
+/*                          Thread reply (revisions)                          */
+/* -------------------------------------------------------------------------- */
 
-async function handleRevision({
-  event,
-  revisionText,
-  outstanding,
-}: {
-  event: SlackMessageEvent;
-  revisionText: string;
-  outstanding: OutstandingDraft;
-}) {
+async function handleThreadReply(event: SlackMessageEvent): Promise<void> {
+  const revisionText = (event.text ?? "").trim();
   if (!revisionText) {
-    await postPlain({
+    await postInThread({
       channel: event.channel,
-      text:
-        ":thinking_face: I see an attachment but no instructions. " +
-        "If you want to revise the previous draft, tell me what to change.",
+      thread_ts: event.thread_ts!,
+      text: ":thinking_face: I see an attachment but no instructions — tell me what to change.",
     });
     return;
   }
 
-  // Resolve recipientIds back to StaffMember entries.
-  const recipients: StaffMember[] = [];
-  for (const id of outstanding.recipientIds) {
-    const m = STAFF.find((s) => s.slackUserId === id);
-    if (m) recipients.push(m);
-  }
-  if (recipients.length === 0) {
-    await postPlain({
-      channel: event.channel,
-      text:
-        ":warning: Couldn't find those recipients in the roster anymore. " +
-        "Start a new draft and mention them by name.",
-    });
-    return;
-  }
-
-  const namesJoined = formatNames(recipients.map((r) => r.name));
-  await postPlain({
+  const last = await findLastDraftInThread({
     channel: event.channel,
-    text: `:writing_hand: Revising the draft for *${namesJoined}*...`,
+    thread_ts: event.thread_ts!,
+    excludeTs: event.ts,
   });
+
+  if (!last) {
+    // No prior draft in this thread. Likely the bot asked a clarifying
+    // question and the owner is answering it — combine the parent
+    // message + this reply and try drafting fresh.
+    await handleClarifyingAnswer(event);
+    return;
+  }
+
+  if (last.alreadySent) {
+    await postInThread({
+      channel: event.channel,
+      thread_ts: event.thread_ts!,
+      text: ":envelope: This thread was already sent. Start a new top-level message for additional feedback.",
+    });
+    return;
+  }
+
+  // Resolve recipients from names (we packed only names into state).
+  const recipients = STAFF.filter((s) =>
+    last.state.recipientNames.includes(s.name),
+  );
+  if (recipients.length === 0) {
+    await postInThread({
+      channel: event.channel,
+      thread_ts: event.thread_ts!,
+      text: ":warning: I couldn't resolve the recipients of the prior draft. Start over with a fresh top-level message.",
+    });
+    return;
+  }
+
+  const routing = resolveDestination(recipients);
+  if (!routing.ok) {
+    await postInThread({
+      channel: event.channel,
+      thread_ts: event.thread_ts!,
+      text: `:warning: ${routing.message}`,
+    });
+    return;
+  }
 
   let newDraft: string;
   try {
     newDraft = await draftMessage({
-      rawInput: outstanding.originalInput,
+      rawInput: last.state.originalInput,
       recipients,
-      previousDraft: outstanding.draft,
+      previousDraft: last.state.draft,
       revisionInstructions: revisionText,
     });
   } catch (err) {
     console.error("[draft] revision failed", err);
-    await postPlain({
+    await postInThread({
       channel: event.channel,
-      text: `:warning: Sorry, couldn't revise the draft. ${
+      thread_ts: event.thread_ts!,
+      text: `:warning: Couldn't revise the draft. ${
         err instanceof Error ? `(${err.message})` : ""
       }`,
     });
     return;
   }
 
-  await markDraftSuperseded({
+  await postDraftInThread({
     channel: event.channel,
-    ts: outstanding.messageTs,
-    recipientNames: outstanding.recipientNames,
-    draft: outstanding.draft,
-  });
-
-  await postDraftWithButtons({
-    channel: event.channel,
-    recipients,
-    originalInput: outstanding.originalInput,
+    thread_ts: event.thread_ts!,
     draft: newDraft,
-    attachmentCount: outstanding.attachmentCount,
+    originalInput: last.state.originalInput,
+    recipients,
+    destination: routing.destination,
+    attachmentCount: last.state.attachmentCount,
+  });
+}
+
+/**
+ * The owner replied in a thread that has no prior draft yet — most
+ * likely because the bot asked them a clarifying question. Fetch the
+ * parent + their reply, combine, and try a fresh draft.
+ */
+async function handleClarifyingAnswer(
+  event: SlackMessageEvent,
+): Promise<void> {
+  const replies = await fetchThreadReplies({
+    channel: event.channel,
+    thread_ts: event.thread_ts!,
+  });
+  const parent = replies[0];
+  const parentText = (parent?.text as string | undefined)?.trim() ?? "";
+  const replyText = (event.text ?? "").trim();
+  // Combine parent and reply so the recipient identifier sees both.
+  const combinedText =
+    parentText && replyText
+      ? `${parentText}\n\nClarification: ${replyText}`
+      : parentText || replyText;
+
+  const recipients = await identifyRecipients(combinedText);
+  if (recipients.length === 0) {
+    await postInThread({
+      channel: event.channel,
+      thread_ts: event.thread_ts!,
+      text: ":thinking_face: Still not sure who this is for. Try mentioning a name (Brendy, Patricia, etc.).",
+    });
+    return;
+  }
+
+  const routing = resolveDestination(recipients);
+  if (!routing.ok) {
+    await postInThread({
+      channel: event.channel,
+      thread_ts: event.thread_ts!,
+      text: `:warning: ${routing.message}`,
+    });
+    return;
+  }
+
+  let draft: string;
+  try {
+    draft = await draftMessage({ rawInput: combinedText, recipients });
+  } catch (err) {
+    console.error("[draft] generation failed", err);
+    await postInThread({
+      channel: event.channel,
+      thread_ts: event.thread_ts!,
+      text: `:warning: Couldn't generate the draft. ${
+        err instanceof Error ? `(${err.message})` : ""
+      }`,
+    });
+    return;
+  }
+
+  await postDraftInThread({
+    channel: event.channel,
+    thread_ts: event.thread_ts!,
+    draft,
+    originalInput: combinedText,
+    recipients,
+    destination: routing.destination,
+    attachmentCount: 0,
   });
 }
 
 /* -------------------------------------------------------------------------- */
-/*                          History lookup for revisions                      */
+/*                              History helpers                               */
 /* -------------------------------------------------------------------------- */
 
-type OutstandingDraft = DraftState & {
+type LastDraftInfo = {
+  state: DraftState;
   messageTs: string;
+  alreadySent: boolean;
 };
 
-async function findOutstandingDrafts({
+const SENT_MARKER = "[sent]";
+
+async function findLastDraftInThread({
   channel,
-  currentMessageTs,
+  thread_ts,
+  excludeTs,
 }: {
   channel: string;
-  currentMessageTs: string;
-}): Promise<OutstandingDraft[]> {
-  const drafts: OutstandingDraft[] = [];
-  try {
-    const history = await getBotClient().conversations.history({
-      channel,
-      limit: 30,
-    });
+  thread_ts: string;
+  excludeTs: string;
+}): Promise<LastDraftInfo | null> {
+  const replies = await fetchThreadReplies({ channel, thread_ts });
 
-    for (const msg of history.messages ?? []) {
-      if (msg.ts === currentMessageTs) continue;
-      if (!msg.bot_id) continue;
-      const state = extractDraftStateFromBlocks(msg.blocks);
-      if (state) {
-        drafts.push({ ...state, messageTs: msg.ts! });
-      }
+  // Walk newest-to-oldest looking for a bot draft message. If we
+  // encounter a "sent" confirmation before finding the draft, the
+  // most recent draft has already been sent.
+  let alreadySent = false;
+  for (let i = replies.length - 1; i >= 0; i--) {
+    const m = replies[i];
+    if (m.ts === excludeTs) continue;
+    if (!m.bot_id) continue;
+    const text = typeof m.text === "string" ? m.text : "";
+    if (text.startsWith(SENT_MARKER)) {
+      alreadySent = true;
+      continue;
     }
-  } catch (err) {
-    console.error("[slack] conversations.history failed", err);
+    const state = extractDraftStateFromBlocks(m.blocks);
+    if (state) {
+      return { state, messageTs: m.ts!, alreadySent };
+    }
   }
-  return drafts;
+  return null;
+}
+
+async function fetchThreadReplies({
+  channel,
+  thread_ts,
+}: {
+  channel: string;
+  thread_ts: string;
+}): Promise<
+  Array<{
+    ts?: string;
+    text?: string;
+    bot_id?: string;
+    user?: string;
+    blocks?: unknown[];
+  }>
+> {
+  try {
+    const res = await getBotClient().conversations.replies({
+      channel,
+      ts: thread_ts,
+      limit: 100,
+    });
+    return (res.messages ?? []) as Array<{
+      ts?: string;
+      text?: string;
+      bot_id?: string;
+      user?: string;
+      blocks?: unknown[];
+    }>;
+  } catch (err) {
+    console.error("[slack] conversations.replies failed", err);
+    return [];
+  }
 }
 
 /* -------------------------------------------------------------------------- */
 /*                                  Posting                                   */
 /* -------------------------------------------------------------------------- */
 
-async function postPlain({
+async function postInThread({
   channel,
+  thread_ts,
   text,
 }: {
   channel: string;
+  thread_ts: string;
   text: string;
 }): Promise<void> {
-  await getBotClient().chat.postMessage({ channel, text });
+  await getBotClient().chat.postMessage({ channel, thread_ts, text });
 }
 
-async function postDraftWithButtons({
+async function postDraftInThread({
   channel,
-  recipients,
-  originalInput,
+  thread_ts,
   draft,
+  originalInput,
+  recipients,
+  destination,
   attachmentCount,
 }: {
   channel: string;
-  recipients: StaffMember[];
-  originalInput: string;
+  thread_ts: string;
   draft: string;
+  originalInput: string;
+  recipients: StaffMember[];
+  destination: import("./routing").Destination;
   attachmentCount: number;
 }): Promise<void> {
   const state: DraftState = {
-    recipientIds: recipients.map((r) => r.slackUserId),
+    destPacked: "", // filled in by buildDraftBlocks via the destination arg
     recipientNames: recipients.map((r) => r.name),
     originalInput,
     draft,
     attachmentCount,
   };
 
-  const namesJoined = formatNames(state.recipientNames);
   await getBotClient().chat.postMessage({
     channel,
-    text: `Draft to ${namesJoined}: ${draft}`, // notification fallback
-    blocks: buildDraftBlocks({ state }),
+    thread_ts,
+    text: draft, // notification fallback
+    blocks: buildDraftBlocks({ state, destination }),
   });
 }
 
-function formatNames(names: string[]): string {
-  if (names.length === 0) return "(unknown)";
-  if (names.length === 1) return names[0];
-  if (names.length === 2) return `${names[0]} and ${names[1]}`;
-  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
-}
-
-function buildClarifyReply({ fileCount }: { fileCount: number }): string {
-  const attachmentNote =
-    fileCount > 0
-      ? `_(${fileCount} attachment${
-          fileCount === 1 ? "" : "s"
-        } noted — I'll include them when sending.)_`
-      : "";
-  const allNames = STAFF.map((s) => `*${s.name}*`).join(", ");
-  return [
-    ":question: I'm not sure who this is for.",
-    "",
-    `Staff I know: ${allNames}.`,
-    "",
-    "Mention them by name (or @-mention) and I'll draft.",
-    attachmentNote,
-  ]
-    .filter(Boolean)
-    .join("\n");
-}
+export const SENT_CONFIRMATION_MARKER = SENT_MARKER;
+export type _ExportedDraftState = DraftState;
+export { destinationFromState };
