@@ -71,10 +71,19 @@ export function pickActionableMessage(
 }
 
 /**
- * Top-level DM handler. Routes to:
- *  - revision flow, if the most recent bot message in the DM is an
- *    outstanding draft
- *  - fresh draft flow, otherwise
+ * Top-level DM handler. The decision tree:
+ *
+ *   1. If the message names a recipient (by @-mention or first-name match):
+ *      → treat as a fresh draft for that recipient. Supersede any
+ *        outstanding draft so the owner doesn't end up with two
+ *        live drafts in the DM.
+ *   2. Else, if there is an outstanding draft sitting in the DM:
+ *      → treat the message as revision instructions for it.
+ *   3. Else:
+ *      → ask who the message is for.
+ *
+ * The key invariant: the moment the owner names anyone, it's a new
+ * request — never an accidental revision of an unrelated draft.
  */
 export async function handleOwnerMessage(
   event: SlackMessageEvent,
@@ -82,11 +91,44 @@ export async function handleOwnerMessage(
   const text = (event.text ?? "").trim();
   const fileCount = event.files?.length ?? 0;
 
+  const recipientMatch = identifyRecipient(text);
   const outstandingDraft = await findOutstandingDraft({
     channel: event.channel,
     currentMessageTs: event.ts,
   });
 
+  const namedSomeone =
+    recipientMatch.kind === "found" || recipientMatch.kind === "ambiguous";
+
+  // Whenever the owner names someone, a possibly-stale outstanding
+  // draft is no longer relevant — strike it through so they know.
+  if (namedSomeone && outstandingDraft) {
+    await markDraftSuperseded({
+      channel: event.channel,
+      ts: outstandingDraft.messageTs,
+      recipientName: outstandingDraft.recipientName,
+    });
+  }
+
+  if (recipientMatch.kind === "found") {
+    await handleFreshDraft({
+      event,
+      text,
+      fileCount,
+      recipient: recipientMatch.person,
+    });
+    return;
+  }
+
+  if (recipientMatch.kind === "ambiguous") {
+    await postPlain({
+      channel: event.channel,
+      text: buildClarifyReply({ match: recipientMatch, fileCount }),
+    });
+    return;
+  }
+
+  // No recipient named.
   if (outstandingDraft) {
     await handleRevision({
       event,
@@ -96,38 +138,33 @@ export async function handleOwnerMessage(
     return;
   }
 
-  await handleFreshDraft({ event, text, fileCount });
+  await postPlain({
+    channel: event.channel,
+    text: buildClarifyReply({ match: recipientMatch, fileCount }),
+  });
 }
 
 async function handleFreshDraft({
   event,
   text,
   fileCount,
+  recipient,
 }: {
   event: SlackMessageEvent;
   text: string;
   fileCount: number;
+  recipient: StaffMember;
 }) {
-  const match = identifyRecipient(text);
-
-  if (match.kind !== "found") {
-    await postPlain({
-      channel: event.channel,
-      text: buildClarifyReply({ match, fileCount }),
-    });
-    return;
-  }
-
   await postPlain({
     channel: event.channel,
-    text: `:writing_hand: Drafting a message for *${match.person.name}*...`,
+    text: `:writing_hand: Drafting a message for *${recipient.name}*...`,
   });
 
   let draft: string;
   try {
     draft = await draftMessage({
       rawInput: text,
-      recipient: match.person,
+      recipient,
     });
   } catch (err) {
     console.error("[draft] generation failed", err);
@@ -142,11 +179,33 @@ async function handleFreshDraft({
 
   await postDraftWithButtons({
     channel: event.channel,
-    recipient: match.person,
+    recipient,
     originalInput: text,
     draft,
     attachmentCount: fileCount,
   });
+}
+
+async function markDraftSuperseded({
+  channel,
+  ts,
+  recipientName,
+}: {
+  channel: string;
+  ts: string;
+  recipientName: string;
+}): Promise<void> {
+  try {
+    await getBotClient().chat.update({
+      channel,
+      ts,
+      text: `~Earlier draft to ${recipientName}~ — superseded.`,
+      blocks: buildSupersededBlocks({ recipientName }),
+    });
+  } catch (err) {
+    console.error("[slack] failed to supersede earlier draft", err);
+    // Don't throw — superseding is housekeeping, not critical-path.
+  }
 }
 
 async function handleRevision({
