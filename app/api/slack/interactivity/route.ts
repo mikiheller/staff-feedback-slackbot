@@ -117,8 +117,20 @@ async function handleSend({
     return;
   }
 
+  if (state.recipientIds.length !== 1) {
+    // Multi-recipient drafts shouldn't have a Send button, but be defensive.
+    await getBotClient().chat.postMessage({
+      channel: payload.channel.id,
+      thread_ts: payload.message.ts,
+      text:
+        ":warning: Multi-recipient drafts have to be copy-pasted manually. " +
+        "Sorry about that.",
+    });
+    return;
+  }
+
   const result = await sendAsOwner({
-    recipientId: state.recipientId,
+    recipientId: state.recipientIds[0],
     text: state.draft,
   });
 
@@ -138,9 +150,9 @@ async function handleSend({
   await getBotClient().chat.update({
     channel: payload.channel.id,
     ts: payload.message.ts,
-    text: `Sent to ${state.recipientName}`,
+    text: `Sent to ${state.recipientNames.join(" & ")}`,
     blocks: buildSentBlocks({
-      recipientName: state.recipientName,
+      recipientNames: state.recipientNames,
       draft: state.draft,
       sentAt: new Date(),
     }),
@@ -154,12 +166,12 @@ async function handleCancel({
   payload: BlockActionsPayload;
   state: DraftState | null;
 }): Promise<void> {
-  const recipientName = state?.recipientName ?? "the recipient";
+  const recipientNames = state?.recipientNames ?? ["the recipient"];
 
   await getBotClient().chat.update({
     channel: payload.channel.id,
     ts: payload.message.ts,
-    text: `Draft to ${recipientName} cancelled.`,
-    blocks: buildCancelledBlocks({ recipientName }),
+    text: `Draft to ${recipientNames.join(" & ")} cancelled.`,
+    blocks: buildCancelledBlocks({ recipientNames }),
   });
 }

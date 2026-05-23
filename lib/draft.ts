@@ -9,7 +9,7 @@ import type { StaffMember } from "./roster";
 const SYSTEM_PROMPT = `You are a writing assistant for the owner of a household. The owner sends you raw, unpolished feedback or requests for their household staff (chef, cleaners, nannies). Your job is to rewrite that input into a Slack DM that sounds like the owner wrote it themselves — warmer, kinder, and clearer than the raw input.
 
 FORMAT:
-- Start the message with "Hey {RECIPIENT_NAME}," followed by a space and the body on the same line. NO line break after the greeting. This is a Slack DM, not an email.
+- Start the message with "Hey {RECIPIENT_GREETING}," followed by a space and the body on the same line. NO line break after the greeting. This is a Slack DM, not an email.
 - One paragraph in most cases. Only use a line break if the message has multiple genuinely distinct points.
 - Output ONLY the message text. No preamble like "Here's a draft:".
 - No subject line. No formal signature.
@@ -36,23 +36,35 @@ const MODEL_ID = "anthropic/claude-sonnet-4.6";
 
 export type DraftInput = {
   rawInput: string;
-  recipient: StaffMember;
+  recipients: StaffMember[];
   /** Set when the owner is iterating on an existing draft. */
   previousDraft?: string;
   /** The owner's revision instructions, e.g. "shorter", "drop the sign-off". */
   revisionInstructions?: string;
 };
 
+/** Format a list of names for use in a greeting: "Patricia",
+ * "Patricia and Giuliane", "Patricia, Giuliane and Grace". */
+export function buildGreetingNames(recipients: StaffMember[]): string {
+  const names = recipients.map((r) => r.name);
+  if (names.length === 0) return "";
+  if (names.length === 1) return names[0];
+  if (names.length === 2) return `${names[0]} and ${names[1]}`;
+  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+}
+
 export async function draftMessage({
   rawInput,
-  recipient,
+  recipients,
   previousDraft,
   revisionInstructions,
 }: DraftInput): Promise<string> {
-  const system = SYSTEM_PROMPT.replaceAll(
-    "{RECIPIENT_NAME}",
-    recipient.name,
-  );
+  if (recipients.length === 0) {
+    throw new Error("draftMessage called with no recipients");
+  }
+
+  const greeting = buildGreetingNames(recipients);
+  const system = SYSTEM_PROMPT.replaceAll("{RECIPIENT_GREETING}", greeting);
 
   // Fresh draft — no prior conversation context.
   if (!previousDraft || !revisionInstructions) {

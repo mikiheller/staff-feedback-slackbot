@@ -2,16 +2,17 @@ import type { KnownBlock } from "@slack/web-api";
 
 /**
  * State carried inside a draft message — what we need to know to send,
- * cancel, or revise it later. We encode this as JSON inside the
- * action buttons' `value` fields, which Slack preserves and sends back
- * to us in the interactivity payload. (We previously tried Slack
- * message metadata for this, but it silently requires the
- * `metadata.message:write` scope, which we don't have — and not having
- * it just makes Slack drop the metadata without erroring.)
+ * cancel, or revise it later. Encoded as JSON inside the action buttons'
+ * `value` fields, which Slack preserves and sends back to us in the
+ * interactivity payload.
+ *
+ * Multi-recipient drafts have multiple recipientIds; single-recipient
+ * drafts have exactly one. We don't add a Send button when there are
+ * multiple recipients (the owner copy-pastes manually).
  */
 export type DraftState = {
-  recipientId: string;
-  recipientName: string;
+  recipientIds: string[];
+  recipientNames: string[];
   /** The owner's original, unpolished input. */
   originalInput: string;
   /** The latest polished draft we're proposing. */
@@ -25,13 +26,13 @@ export const ACTION_CANCEL_DRAFT = "cancel_draft";
 // Slack caps button `value` at 2000 chars. We truncate the original input
 // (used only when revising) to leave room for everything else. The draft
 // itself is always preserved verbatim because we use it to actually send.
-const MAX_BUTTON_VALUE_BYTES = 1900; // small safety margin
+const MAX_BUTTON_VALUE_BYTES = 1900;
 const MAX_ORIGINAL_INPUT_CHARS_WHEN_PACKING = 1200;
 
 function packState(state: DraftState): string {
   const compact = {
-    rId: state.recipientId,
-    rN: state.recipientName,
+    rIds: state.recipientIds,
+    rNs: state.recipientNames,
     oI:
       state.originalInput.length > MAX_ORIGINAL_INPUT_CHARS_WHEN_PACKING
         ? state.originalInput.slice(0, MAX_ORIGINAL_INPUT_CHARS_WHEN_PACKING)
@@ -41,9 +42,11 @@ function packState(state: DraftState): string {
   };
   let json = JSON.stringify(compact);
   if (json.length > MAX_BUTTON_VALUE_BYTES) {
-    // Last-resort truncation: trim the original input further.
     const overshoot = json.length - MAX_BUTTON_VALUE_BYTES;
-    compact.oI = compact.oI.slice(0, Math.max(0, compact.oI.length - overshoot - 10));
+    compact.oI = compact.oI.slice(
+      0,
+      Math.max(0, compact.oI.length - overshoot - 10),
+    );
     json = JSON.stringify(compact);
   }
   return json;
@@ -55,18 +58,34 @@ export function unpackStateFromButtonValue(
   if (!value) return null;
   try {
     const parsed = JSON.parse(value) as {
-      rId?: string;
-      rN?: string;
+      rIds?: unknown;
+      rNs?: unknown;
       oI?: string;
       d?: string;
       a?: number;
+      // Tolerate the v1 shape that had single recipientId/recipientName fields.
+      rId?: string;
+      rN?: string;
     };
-    if (!parsed.rId || !parsed.rN || typeof parsed.d !== "string") {
+    let recipientIds: string[];
+    let recipientNames: string[];
+    if (Array.isArray(parsed.rIds) && parsed.rIds.every((x) => typeof x === "string")) {
+      recipientIds = parsed.rIds as string[];
+      recipientNames = Array.isArray(parsed.rNs)
+        ? (parsed.rNs as unknown[]).filter((x): x is string => typeof x === "string")
+        : [];
+    } else if (typeof parsed.rId === "string" && typeof parsed.rN === "string") {
+      recipientIds = [parsed.rId];
+      recipientNames = [parsed.rN];
+    } else {
+      return null;
+    }
+    if (recipientIds.length === 0 || typeof parsed.d !== "string") {
       return null;
     }
     return {
-      recipientId: parsed.rId,
-      recipientName: parsed.rN,
+      recipientIds,
+      recipientNames,
       originalInput: parsed.oI ?? "",
       draft: parsed.d,
       attachmentCount: parsed.a ?? 0,
@@ -76,63 +95,81 @@ export function unpackStateFromButtonValue(
   }
 }
 
+function joinNames(names: string[]): string {
+  if (names.length === 0) return "(unknown)";
+  if (names.length === 1) return names[0];
+  if (names.length === 2) return `${names[0]} and ${names[1]}`;
+  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+}
+
 /**
- * The message the owner sees in their DM with the bot. Includes the
- * draft text, the action buttons, and a hint about how to revise.
- * Both buttons carry the full state as JSON so we can recover it
- * whichever one is clicked, and so the revision flow can find it by
- * scanning recent message blocks.
+ * The active draft message: just the draft text and the action buttons.
+ * No quote bar, no "Draft to X:" preamble.
+ *
+ * - Single recipient → [Send to <name>] [Cancel]
+ * - Multiple recipients → [Cancel] only (owner copies/pastes to send)
  */
 export function buildDraftBlocks({
   state,
 }: {
   state: DraftState;
 }): KnownBlock[] {
-  const attachmentNote =
-    state.attachmentCount > 0
-      ? `\n\n_${state.attachmentCount} attachment${
-          state.attachmentCount === 1 ? "" : "s"
-        } will be included when sending._`
-      : "";
-
+  const isMultiRecipient = state.recipientIds.length > 1;
+  const namesJoined = joinNames(state.recipientNames);
   const packedValue = packState(state);
 
-  return [
+  const blocks: KnownBlock[] = [
     {
       type: "section",
-      text: {
-        type: "mrkdwn",
-        text: `*Draft to ${state.recipientName}:*`,
-      },
+      text: { type: "mrkdwn", text: state.draft },
     },
-    {
-      type: "section",
-      text: {
-        type: "mrkdwn",
-        // Use a quote block so the draft visually reads like the message
-        // it'll become. Easier to eyeball at a glance.
-        text: `> ${state.draft.replace(/\n/g, "\n> ")}${attachmentNote}`,
-      },
-    },
-    {
+  ];
+
+  if (state.attachmentCount > 0) {
+    blocks.push({
       type: "context",
       elements: [
         {
           type: "mrkdwn",
-          text:
-            "_Reply with changes to revise (e.g. \"shorter\", \"drop the sign-off\"), " +
-            "or use the buttons below._",
+          text: `_${state.attachmentCount} attachment${
+            state.attachmentCount === 1 ? "" : "s"
+          } will be included when sending._`,
         },
       ],
-    },
-    {
+    });
+  }
+
+  if (isMultiRecipient) {
+    blocks.push({
+      type: "context",
+      elements: [
+        {
+          type: "mrkdwn",
+          text: `_Multiple recipients (${namesJoined}) — copy and send manually, or reply with changes to revise._`,
+        },
+      ],
+    });
+    blocks.push({
+      type: "actions",
+      elements: [
+        {
+          type: "button",
+          text: { type: "plain_text", text: "Cancel" },
+          style: "danger",
+          action_id: ACTION_CANCEL_DRAFT,
+          value: packedValue,
+        },
+      ],
+    });
+  } else {
+    blocks.push({
       type: "actions",
       elements: [
         {
           type: "button",
           text: {
             type: "plain_text",
-            text: `Send to ${state.recipientName}`,
+            text: `Send to ${namesJoined}`,
             emoji: true,
           },
           style: "primary",
@@ -147,14 +184,15 @@ export function buildDraftBlocks({
           value: packedValue,
         },
       ],
-    },
-  ];
+    });
+  }
+
+  return blocks;
 }
 
 /**
- * Find a draft state inside the message blocks (used by the revision
- * flow, which scans recent DM history for an outstanding draft). Returns
- * null if the message isn't a draft.
+ * Find a draft state inside the message blocks. Used by the revision
+ * scanner to locate outstanding drafts in the DM history.
  */
 export function extractDraftStateFromBlocks(
   blocks: unknown[] | undefined,
@@ -162,27 +200,35 @@ export function extractDraftStateFromBlocks(
   if (!Array.isArray(blocks)) return null;
   for (const block of blocks) {
     if (
-      typeof block === "object" &&
-      block !== null &&
-      "type" in block &&
-      block.type === "actions" &&
-      "elements" in block &&
-      Array.isArray((block as { elements?: unknown[] }).elements)
+      typeof block !== "object" ||
+      block === null ||
+      !("type" in block) ||
+      block.type !== "actions" ||
+      !("elements" in block) ||
+      !Array.isArray((block as { elements?: unknown[] }).elements)
     ) {
-      const elements = (block as { elements: unknown[] }).elements;
-      for (const el of elements) {
-        if (
-          typeof el === "object" &&
-          el !== null &&
-          "action_id" in el &&
-          el.action_id === ACTION_SEND_DRAFT &&
-          "value" in el &&
-          typeof (el as { value?: unknown }).value === "string"
-        ) {
-          return unpackStateFromButtonValue(
-            (el as { value: string }).value,
-          );
-        }
+      continue;
+    }
+    const elements = (block as { elements: unknown[] }).elements;
+    for (const el of elements) {
+      if (
+        typeof el !== "object" ||
+        el === null ||
+        !("action_id" in el) ||
+        !("value" in el) ||
+        typeof (el as { value?: unknown }).value !== "string"
+      ) {
+        continue;
+      }
+      const actionId = (el as { action_id: unknown }).action_id;
+      if (
+        actionId === ACTION_SEND_DRAFT ||
+        actionId === ACTION_CANCEL_DRAFT
+      ) {
+        const state = unpackStateFromButtonValue(
+          (el as { value: string }).value,
+        );
+        if (state) return state;
       }
     }
   }
@@ -191,11 +237,11 @@ export function extractDraftStateFromBlocks(
 
 /** Replaces a draft message after the owner clicks Send. */
 export function buildSentBlocks({
-  recipientName,
+  recipientNames,
   draft,
   sentAt,
 }: {
-  recipientName: string;
+  recipientNames: string[];
   draft: string;
   sentAt: Date;
 }): KnownBlock[] {
@@ -205,34 +251,35 @@ export function buildSentBlocks({
   });
   return [
     {
-      type: "section",
-      text: {
-        type: "mrkdwn",
-        text: `:white_check_mark: *Sent to ${recipientName}* at ${timeStr}`,
-      },
+      type: "context",
+      elements: [
+        {
+          type: "mrkdwn",
+          text: `:white_check_mark: Sent to *${joinNames(
+            recipientNames,
+          )}* at ${timeStr}`,
+        },
+      ],
     },
     {
       type: "section",
-      text: {
-        type: "mrkdwn",
-        text: `> ${draft.replace(/\n/g, "\n> ")}`,
-      },
+      text: { type: "mrkdwn", text: draft },
     },
   ];
 }
 
 /** Replaces a draft message after the owner clicks Cancel. */
 export function buildCancelledBlocks({
-  recipientName,
+  recipientNames,
 }: {
-  recipientName: string;
+  recipientNames: string[];
 }): KnownBlock[] {
   return [
     {
       type: "section",
       text: {
         type: "mrkdwn",
-        text: `:no_entry_sign: Draft to ${recipientName} cancelled.`,
+        text: `:no_entry_sign: Draft to ${joinNames(recipientNames)} cancelled.`,
       },
     },
   ];
@@ -240,34 +287,32 @@ export function buildCancelledBlocks({
 
 /** Replaces a draft message after the owner asks for a revision. */
 export function buildSupersededBlocks({
-  recipientName,
+  recipientNames,
   draft,
 }: {
-  recipientName: string;
+  recipientNames: string[];
   draft: string;
 }): KnownBlock[] {
-  // Wrap each line in `~...~` so Slack renders the prior draft as
-  // struck-through. Tildes inside the draft itself are uncommon in
-  // English text; we accept that breaking edge case for simplicity.
   const struckDraft = draft
     .split("\n")
-    .map((line) => (line.length > 0 ? `> ~${line}~` : ">"))
+    .map((line) => (line.length > 0 ? `~${line}~` : ""))
     .join("\n");
 
   return [
     {
-      type: "section",
-      text: {
-        type: "mrkdwn",
-        text: `_Earlier draft to ${recipientName} — revised below:_`,
-      },
+      type: "context",
+      elements: [
+        {
+          type: "mrkdwn",
+          text: `_Earlier draft to ${joinNames(
+            recipientNames,
+          )} — revised below:_`,
+        },
+      ],
     },
     {
       type: "section",
-      text: {
-        type: "mrkdwn",
-        text: struckDraft,
-      },
+      text: { type: "mrkdwn", text: struckDraft },
     },
   ];
 }

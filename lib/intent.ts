@@ -1,23 +1,21 @@
 import { generateText, Output } from "ai";
 import { z } from "zod";
+import { STAFF, type StaffMember } from "./roster";
 
 /**
- * Classifier that decides whether the owner's incoming message is:
+ * Classifier that decides what the owner wants:
  *
- *   - "new":    a new piece of feedback that should be drafted from
- *               scratch (recipient identification happens after this)
- *   - "revise": an instruction to edit an existing outstanding draft
+ *   - "new":    a new piece of feedback. Returns the *intended*
+ *               recipients (people the message is FOR, not just
+ *               anyone mentioned in passing).
+ *   - "revise": an instruction to edit an existing outstanding draft,
+ *               with a 1-based index into the outstanding-drafts list.
  *
- * If "revise", the result also indicates which draft (1-based index in
- * the outstandingDrafts list passed in). Defaults to the most recent
- * draft (index 1) unless the owner makes it obvious they mean another.
- *
- * Run on a small/fast Claude (Haiku) so the extra latency is minimal —
- * usually well under 1s.
+ * Run on Claude Haiku for ~500ms latency.
  */
 
 export type OutstandingDraftSummary = {
-  recipientName: string;
+  recipientNames: string[];
   draft: string;
   /** Original raw input that produced the current draft, helps the
    * classifier decide whether new text is "more of the same" or different. */
@@ -25,44 +23,47 @@ export type OutstandingDraftSummary = {
 };
 
 export type IntentResult =
-  | { kind: "new" }
+  | { kind: "new"; recipients: StaffMember[] }
   | { kind: "revise"; draftIndex: number };
 
-const IntentSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("new") }),
+const RawIntentSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("new"),
+    recipientNames: z.array(z.string()),
+  }),
   z.object({
     kind: z.literal("revise"),
     draftIndex: z.number().int().min(1),
   }),
 ]);
 
-const SYSTEM_PROMPT = `You are routing messages from a household owner to a draft assistant. The owner sometimes has "outstanding drafts" — messages they've already drafted but haven't yet sent. When they send a new message, your job is to decide:
+function buildSystemPrompt(): string {
+  const rosterList = STAFF.map((s) => `- ${s.name}`).join("\n");
+  return `You are routing messages from a household owner to a draft assistant. The owner has a roster of staff and family members; they sometimes have one or more "outstanding drafts" — messages they've already drafted but haven't yet sent.
 
-- "new": a new piece of feedback the owner wants drafted for someone (could be the same person as an outstanding draft, but it's clearly a new specific request, not an edit to an existing draft)
-- "revise": an instruction to edit one of the outstanding drafts
+Your job, when a new message comes in, is to decide:
 
-If "revise", indicate WHICH draft via the 1-based draftIndex. Default to the most recent draft (1). Only pick a different index if the owner explicitly mentions a recipient whose draft is older (e.g. "make the Brendy one shorter" when an older draft for Brendy exists).
+1. Is this a NEW piece of feedback the owner wants drafted, or a REVISION of one of the outstanding drafts?
+
+2. If NEW, who are the intended RECIPIENTS — the people the message is being SENT TO. People mentioned for context (e.g. "while Grace is out", "Jake and Miki will pitch in") are NOT recipients. Pick names ONLY from this roster:
+${rosterList}
+
+3. If REVISE, which draft (1-based index)? Default to most recent (1) unless the owner clearly names a different one ("make the Brendy one shorter" when Brendy isn't the most recent).
 
 Heuristics:
-- Short message with edit-style verbs ("shorter", "warmer", "drop the X", "less Y", "more like Z", "add X") → "revise"
-- Short message naming a recipient followed by edit instructions ("for Brendy, drop the sign-off") → "revise"
-- A new substantive piece of feedback or a new specific topic, even if it names a person who already has an outstanding draft → "new"
-- A long detailed instruction about what they want said → "new"
-- If there are no outstanding drafts, the answer is always "new".
+- Short message with edit-style verbs ("shorter", "warmer", "drop the X", "less Y", "more like Z", "add X") → revise (most recent)
+- Short message naming a recipient followed by edit instructions ("for Brendy, drop the sign-off") → revise (Brendy's draft)
+- A new substantive piece of feedback or a new specific topic, even if it names a person who already has an outstanding draft → new
+- A long detailed instruction about what they want said → new
+- "I want to message X and Y about ..." → new, recipients = [X, Y] (and only X and Y; don't include other names mentioned for context)
+- If there are no outstanding drafts, the answer is always new.
 
-Examples:
-  Outstanding: [1] To Brendy: "Hey Brendy, just wanted to flag the crumbs..."
-  Owner: "shorter please"  →  revise, 1
+Output STRICTLY one of these JSON shapes (no extra text):
+- {"kind": "new", "recipientNames": ["Patricia", "Giuliane"]}
+- {"kind": "revise", "draftIndex": 1}
 
-  Outstanding: [1] To Brendy: "Hey Brendy, just wanted to flag the crumbs..."
-  Owner: "Brendy, also tomorrow can you do extra dusting"  →  new
-
-  Outstanding: [1] To Patricia: "Hey Patricia, the chicken's been salty..."
-              [2] To Brendy: "Hey Brendy, the bathroom mirror..."
-  Owner: "make the Brendy one warmer"  →  revise, 2
-
-  Outstanding: (none)
-  Owner: "warmer"  →  new`;
+If you can't tell who a NEW message is for, return {"kind":"new","recipientNames":[]} and the system will ask the owner.`;
+}
 
 export async function classifyIntent({
   text,
@@ -71,40 +72,64 @@ export async function classifyIntent({
   text: string;
   outstandingDrafts: OutstandingDraftSummary[];
 }): Promise<IntentResult> {
-  // Trivial path: no outstanding drafts → always new.
-  if (outstandingDrafts.length === 0) {
-    return { kind: "new" };
-  }
+  // No outstanding drafts → can't be a revise. Skip the LLM call only if
+  // we don't need recipient identification — but we do, so we still call.
+  // The model is cheap and fast.
 
-  const draftsList = outstandingDrafts
-    .map(
-      (d, i) =>
-        `[${i + 1}] To ${d.recipientName}\n  original_input: "${d.originalInput}"\n  current_draft: "${d.draft}"`,
-    )
-    .join("\n");
+  const draftsList =
+    outstandingDrafts.length === 0
+      ? "(none)"
+      : outstandingDrafts
+          .map(
+            (d, i) =>
+              `[${i + 1}] To ${d.recipientNames.join(" & ")}\n  original_input: "${d.originalInput}"\n  current_draft: "${d.draft}"`,
+          )
+          .join("\n");
 
-  const userPrompt = `Outstanding drafts (most recent first):\n${draftsList}\n\nThe owner just said:\n"${text}"\n\nClassify.`;
+  const userPrompt = `Outstanding drafts (most recent first):\n${draftsList}\n\nThe owner just said:\n"""\n${text}\n"""\n\nClassify.`;
 
+  let raw: z.infer<typeof RawIntentSchema>;
   try {
     const { output } = await generateText({
       model: "anthropic/claude-haiku-4.5",
-      system: SYSTEM_PROMPT,
+      system: buildSystemPrompt(),
       prompt: userPrompt,
-      output: Output.object({ schema: IntentSchema }),
+      output: Output.object({ schema: RawIntentSchema }),
     });
-    // Sanity-check the draftIndex against actual outstanding drafts.
-    if (output.kind === "revise") {
-      if (
-        output.draftIndex < 1 ||
-        output.draftIndex > outstandingDrafts.length
-      ) {
-        // out of range → default to most recent
+    raw = output;
+  } catch (err) {
+    console.error("[intent] classification failed, defaulting to empty new", err);
+    return { kind: "new", recipients: [] };
+  }
+
+  if (raw.kind === "revise") {
+    if (raw.draftIndex < 1 || raw.draftIndex > outstandingDrafts.length) {
+      // out-of-range index → fall back to most recent if any
+      if (outstandingDrafts.length > 0) {
         return { kind: "revise", draftIndex: 1 };
       }
+      // No outstanding drafts to revise → treat as new with no recipients,
+      // which makes the bot ask for clarification.
+      return { kind: "new", recipients: [] };
     }
-    return output;
-  } catch (err) {
-    console.error("[intent] classification failed, defaulting to new", err);
-    return { kind: "new" };
+    return { kind: "revise", draftIndex: raw.draftIndex };
   }
+
+  // raw.kind === "new" — resolve names against the roster.
+  const seen = new Set<string>();
+  const resolved: StaffMember[] = [];
+  for (const name of raw.recipientNames) {
+    const normalized = name.trim().toLowerCase();
+    const match = STAFF.find(
+      (s) =>
+        s.name.toLowerCase() === normalized ||
+        s.aliases.some((a) => a.toLowerCase() === normalized),
+    );
+    if (match && !seen.has(match.slackUserId)) {
+      seen.add(match.slackUserId);
+      resolved.push(match);
+    }
+  }
+
+  return { kind: "new", recipients: resolved };
 }
