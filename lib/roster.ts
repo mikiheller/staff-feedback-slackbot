@@ -51,9 +51,7 @@ export const STAFF: readonly StaffMember[] = [
   },
   {
     name: "Sheryl",
-    // TODO: replace with Sheryl's actual Slack member ID. Until this
-    // is filled in, the bot can't route messages to her.
-    slackUserId: "PLACEHOLDER_SHERYL_USER_ID",
+    slackUserId: "U08FJR00VGR",
     aliases: ["sheryl"],
   },
 ] as const;

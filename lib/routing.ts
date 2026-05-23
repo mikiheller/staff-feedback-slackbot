@@ -27,9 +27,9 @@ import { STAFF, type StaffMember } from "./roster";
 // Until these are filled in, sending to #food / #brendy-jake-miki /
 // #rota will return a clear error to the owner so it's obvious what's
 // blocking.
-export const FOOD_CHANNEL_ID = "PLACEHOLDER_FOOD_CHANNEL_ID";
-export const BRENDY_CHANNEL_ID = "PLACEHOLDER_BRENDY_CHANNEL_ID";
-export const ROTA_CHANNEL_ID = "PLACEHOLDER_ROTA_CHANNEL_ID";
+export const FOOD_CHANNEL_ID = "C07TE35FEAK";
+export const BRENDY_CHANNEL_ID = "C0AAA695CKC";
+export const ROTA_CHANNEL_ID = "C0ADF52JLF7";
 
 // Jake — automatic +1 on Patricia / Giuliane / Sheryl mpims.
 const JAKE_USER_ID = "U07PP9G968M";
